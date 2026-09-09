@@ -36,6 +36,8 @@ For any other required scan phase, canonical-artifact write, or on-disk existenc
 
 If `complete_codex_security_scan` or the terminal/chat finalizer fails, stop the current response and surface the exact MCP or finalizer error. Do not retry completion in the same response, return a final report or no-findings result, or satisfy a structured output schema. Leave the durable scan available for a later continuation instead of canceling or failing it solely because completion failed.
 
+For an unregistered local terminal scan whose findings or coverage lack `scanId`, a later continuation cannot reconstruct the missing identity binding. Follow [Incomplete Local Terminal Scans](scan-contract.md#incomplete-local-terminal-scans): preserve the directory unchanged as incomplete evidence and start a fresh scan with a new ID and output directory. When initially authoring terminal canonical JSON, set both artifact `scanId` fields to the manifest's `scan.id`; the terminal finalizer does not supply them from the manifest.
+
 Canonical report semantics live in these fields:
 
 - `scan-manifest.json`: `scan.scope` and `scan.threatModel`
