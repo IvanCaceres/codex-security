@@ -69,6 +69,7 @@
     "scripts/normalize_candidates.py",
     "scripts/rank_preview.py",
     "scripts/report_projection.py",
+    "scripts/scan_draft.py",
     "scripts/snapshot_sqlite.py",
     "scripts/validate_scan_contract.py",
     "scripts/validate_tracking_source.py",
