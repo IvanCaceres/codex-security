@@ -510,14 +510,14 @@ def _same_reviewed_content(before: sqlite3.Row, after: sqlite3.Row) -> bool:
 
 def _rule_location_identities(
     connection: sqlite3.Connection, findings: dict[str, sqlite3.Row]
-) -> dict[tuple[str, str, int, int], list[str]]:
-    identities: dict[tuple[str, str, int, int], list[str]] = {}
+) -> dict[tuple[str, str, int, int, str], list[str]]:
+    identities: dict[tuple[str, str, int, int, str], list[str]] = {}
     located: set[str] = set()
     for row in _rows_for_ids(
         connection,
         """
         SELECT occurrences.id AS occurrence_id, occurrences.finding_id,
-            findings.rule_id, locations.relative_path,
+            findings.rule_id, findings.identity_instance, locations.relative_path,
             locations.start_line, locations.end_line
         FROM finding_occurrences AS occurrences
         JOIN findings ON findings.id = occurrences.finding_id
@@ -532,7 +532,13 @@ def _rule_location_identities(
         if row["occurrence_id"] in located:
             continue
         located.add(row["occurrence_id"])
-        key = (row["rule_id"], row["relative_path"], row["start_line"], row["end_line"])
+        key = (
+            row["rule_id"],
+            row["relative_path"],
+            row["start_line"],
+            row["end_line"],
+            row["identity_instance"] or "",
+        )
         identities.setdefault(key, []).append(row["finding_id"])
     return identities
 
@@ -542,7 +548,7 @@ def _equivalent_finding_links(
     before_findings: dict[str, sqlite3.Row],
     after_findings: dict[str, sqlite3.Row],
 ) -> list[tuple[str, str]]:
-    """Pair before/after findings that unambiguously share a rule and primary location."""
+    """Pair findings that unambiguously share a rule, primary location, and instance."""
     before_keys = _rule_location_identities(connection, before_findings)
     after_keys = _rule_location_identities(connection, after_findings)
     return [

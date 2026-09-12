@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import pytest
 from test_workbench_db import HEAD_CHANGED_WARNING
 from test_workbench_deep_scan import begin_target_scan
 from test_workbench_prompt_only_scan import start_headless_standard_scan, start_prompt_only_scan
@@ -97,6 +98,7 @@ def create_cli_scan(
     extra_anchors: tuple[str, ...] = (),
     finding: bool = True,
     identity_anchor: str = "archive-entry-write-without-containment",
+    identity_instance: str | None = None,
     mode: str = "standard",
     parent_scan_id: str | None = None,
     paths: list[str] | None = None,
@@ -160,9 +162,11 @@ def create_cli_scan(
         target_revision=target_revision,
         snapshot_digest=snapshot_digest,
     )
-    if not finding or extra_anchors:
+    if not finding or extra_anchors or identity_instance is not None:
         findings_path = scan_dir / "findings.json"
         findings = json.loads(findings_path.read_text())
+        if identity_instance is not None:
+            findings["findings"][0]["identity"]["instance"] = identity_instance
         if not finding:
             findings["findings"] = []
         else:
@@ -866,21 +870,24 @@ def test_scan_comparison_requires_saved_matches_and_remains_read_only(tmp_path: 
         assert connection.execute("SELECT * FROM finding_occurrences").fetchall() == occurrences
 
 
+@pytest.mark.parametrize("identity_instance", [None, "archive-entry"])
 def test_scan_comparison_matches_equivalent_findings_across_standard_and_deep_scans(
     tmp_path: Path,
+    identity_instance: str | None,
 ) -> None:
     state_dir = tmp_path / "state"
     repository = tmp_path / "repository"
     (repository / "src").mkdir(parents=True)
     (repository / "src" / "extract.py").write_text("destination.write_bytes(entry.read())\n")
     root = tmp_path / "results"
-    standard = create_cli_scan(state_dir, root, repository)
+    standard = create_cli_scan(state_dir, root, repository, identity_instance=identity_instance)
     deep = create_cli_scan(
         state_dir,
         root,
         repository,
         mode="deep",
         identity_anchor="archive-extraction-missing-destination-containment",
+        identity_instance=identity_instance,
     )
 
     baseline = compare_scan_pair(state_dir, standard, deep, "--include-matching-inputs")
@@ -911,6 +918,35 @@ def test_scan_comparison_matches_equivalent_findings_across_standard_and_deep_sc
     )
     assert uncertain["summary"]["persisting"] == 1
     assert uncertain["summary"]["unknown"] == 0
+
+
+@pytest.mark.parametrize(
+    ("before_instance", "after_instance"),
+    [("first-entry", "second-entry"), ("first-entry", None), (None, "second-entry")],
+)
+def test_scan_comparison_keeps_different_instances_at_the_same_location_separate(
+    tmp_path: Path, before_instance: str | None, after_instance: str | None
+) -> None:
+    state_dir = tmp_path / "state"
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    root = tmp_path / "results"
+    before = create_cli_scan(state_dir, root, repository, identity_instance=before_instance)
+    after = create_cli_scan(
+        state_dir, root, repository, mode="deep", identity_instance=after_instance
+    )
+
+    compared = compare_scan_pair(state_dir, before, after, "--include-matching-inputs")
+    inputs = compared["matchingInputs"]
+    assert len(inputs["before"]) == len(inputs["after"]) == 1
+    assert inputs["before"][0]["findingId"] != inputs["after"][0]["findingId"]
+    assert compared["summary"] == {
+        "new": 1,
+        "persisting": 0,
+        "resolved": 1,
+        "reopened": 0,
+        "unknown": 0,
+    }
 
 
 def test_scan_comparison_keeps_changed_content_and_ambiguous_locations_for_semantic_matching(
