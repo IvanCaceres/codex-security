@@ -134,6 +134,7 @@ describe("live scan dashboard", () => {
       {
         repository: "/synthetic/project",
         presentation: "components",
+        showCost: true,
         input,
         clock: {
           ...fakeClock(),
@@ -299,12 +300,15 @@ describe("live scan dashboard", () => {
     expect(frame()).toContain("Component 19");
     expect(frame()).not.toContain("Component 0 ");
     expect(frame()).toContain("[redacted] unavailable");
+    expect(frame()).not.toContain("Cost");
     expect(
       frame()
         .split("\n")
         .every((line) => line.length <= 80),
     ).toBe(true);
-    input.emit("data", "\r\u0003");
+    input.emit("data", "\r");
+    expect(frame()).not.toContain("COST");
+    input.emit("data", "\u0003");
     expect(interrupted).toBe(true);
     dashboard.stop();
   });
@@ -567,7 +571,9 @@ describe("live scan dashboard", () => {
     expect(text).toContain("0 / 1,258 reviewed");
     expect(text).not.toContain("opened");
     expect(text).not.toContain("3 / 6 active");
-    expect(text).toContain("17,985 in · 10,496 cached · 236 out");
+    expect(text.replace(/\s+/gu, " ")).toContain(
+      "unavailable uncached input, 10,496 cache reads, unavailable cache writes, 236 output, 18,221 total",
+    );
     expect(text).toContain("/ $2.00");
     expect(stderr.text()).toContain("\u001B[?1049h");
     expect(stderr.text()).toContain("\u001B[?1049l");
@@ -620,10 +626,10 @@ describe("live scan dashboard", () => {
     expect(frame).not.toContain("FILES");
     expect(frame).not.toContain("inspecting repository files");
     expect(frame).not.toContain("0 / 1,258 reviewed");
-    expect(frame).toContain("worker 1 · Reviewed source file 1");
+    expect(frame).toContain("worker 1 · Reviewed source file 2");
     expect(frame).toContain("worker 1 · Reviewed source file 6");
     expect(frame).toContain("TOKENS");
-    expect(frame).toContain("COST");
+    expect(frame).not.toContain("COST");
     expect(frame).toContain("TIME");
   });
 
@@ -881,7 +887,7 @@ describe("live scan dashboard", () => {
     expect(frame).not.toContain("above live");
 
     input.emit("data", "\u001B[5~");
-    expect(lastFrame(stderr)).toContain("6 lines above live");
+    expect(lastFrame(stderr)).toContain("7 lines above live");
     input.emit("data", "\u001B[6~");
     expect(lastFrame(stderr)).not.toContain("above live");
     dashboard.stop();
