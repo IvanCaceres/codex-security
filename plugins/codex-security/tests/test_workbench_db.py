@@ -4188,7 +4188,7 @@ def test_workbench_preserves_dirty_git_scan_after_worktree_changes(tmp_path: Pat
         (Path(str(started["results"]["scanDir"])) / "scan-manifest.json").read_text()
     )
     assert manifest["scan"]["target"]["kind"] == "git_worktree"
-    assert manifest["scan"]["target"]["snapshotDigest"] == snapshot_digest
+    assert manifest["scan"]["target"]["snapshotDigest"] == contract["requiredSnapshotDigest"]
 
     started = start_delivered_scan(state_dir, "--workspace-id", str(saved["id"]))
     scan_id = str(started["results"]["scanId"])
