@@ -316,6 +316,40 @@ def test_scoped_cli_completion_adopts_registered_revision_kind(tmp_path: Path) -
     assert sealed_coverage["mode"] == "scoped_path"
 
 
+def test_full_repository_completion_adopts_registered_revision_kind(tmp_path: Path) -> None:
+    # A full-repository bulk scan uses a clean detached checkout. Its worktree
+    # draft seals with the same registered revision kind as a path-scoped scan.
+    state_dir = tmp_path / "state"
+    target = tmp_path / "target"
+    revision = initialize_git_repository(target)
+    subprocess.run(["git", "checkout", "--detach", revision], cwd=target, check=True)
+    scan_dir = tmp_path / "scan"
+    registered = register_cli_scan(state_dir, target, scan_dir)
+    assert registered["contract"]["target"]["allowedKinds"] == ["git_revision"]
+    scan_id = str(registered["scanId"])
+    write_completed_contract(
+        scan_dir,
+        scan_id,
+        target,
+        relative_path="README.md",
+        target_kind="git_worktree",
+        target_revision=revision,
+        snapshot_digest=f"codex-security-snapshot/v1:sha256:{'b' * 64}",
+    )
+
+    completed = run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)
+
+    assert completed["scan"]["progress"]["status"] == "complete"
+    manifest = json.loads((scan_dir / "scan-manifest.json").read_text())
+    assert manifest["scan"]["target"]["kind"] == "git_revision"
+    assert manifest["scan"]["target"]["revision"] == revision
+    assert "snapshotDigest" not in manifest["scan"]["target"]
+    assert manifest["scan"]["scope"]["includePaths"] == ["."]
+    coverage = json.loads((scan_dir / "coverage.json").read_text())
+    assert coverage["mode"] == "repository"
+    assert (scan_dir / "report.md").is_file()
+
+
 def test_cli_completion_adopts_registered_worktree_kind_for_revision_draft(
     tmp_path: Path,
 ) -> None:
