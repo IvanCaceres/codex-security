@@ -1,20 +1,15 @@
+import { workbenchArgs } from "./src/workbench-arguments.js";
 import {
   readingAnnotations,
   writingAnnotations,
 } from "./src/server/tool-annotations.js";
 import type { JsonObject } from "./src/types.js";
 import { isRecord as isJsonObject } from "./src/record.js";
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
-import { join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
-import {
-  missingPythonHelperMessage,
-  resolvePythonCommand,
-} from "./src/python_command.js";
+import { resolvePythonCommand } from "./src/python_command.js";
 import { version as MCP_APP_VERSION } from "./package.json";
 import {
   handoffClaimTokenSchema,
@@ -35,13 +30,10 @@ import {
 } from "./src/deep-scan/parent-sandbox.js";
 import { WorkbenchDeepScanStore } from "./src/deep-scan/store.js";
 import type { DeepScanRunState } from "./src/deep-scan/types.js";
-import { WORKBENCH_PYTHON } from "./src/server/workbench-process.js";
+import { PLUGIN_ROOT, runWorkbench, scanRoot } from "./src/workbench-client.js";
 
-const execFileAsync = promisify(execFile);
-const CONFIGURED_SCAN_ROOT = process.env.CODEX_SECURITY_SCAN_ROOT?.trim();
-const PLUGIN_ROOT =
-  process.env.CODEX_SECURITY_PLUGIN_ROOT || resolve(__dirname, "..");
 const USER_INPUT_WAIT_TIMEOUT_MS = 14 * 60 * 1000;
+
 const userContextSchema = z.string().trim().min(1);
 const editableUserContextSchema = z.string().trim();
 const pathSchema = z
@@ -93,16 +85,6 @@ const daybreakEntitlementContextSchema = z.object({
     cyber_trusted_access: verifiedAccessSnapshotSchema,
   }),
 });
-
-async function scanRoot(): Promise<string> {
-  const result = await runWorkbench([
-    "resolve-scan-root",
-    ...optionalArg("--scan-root", CONFIGURED_SCAN_ROOT),
-  ]);
-  if (typeof result.scanRoot !== "string")
-    throw new Error("Missing scan artifact root.");
-  return result.scanRoot;
-}
 
 const diffTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({
@@ -845,11 +827,9 @@ export function createCodexSecurityServer(): McpServer {
       _meta: appMeta,
     },
     async ({ targetPath }) => {
-      const target = await runWorkbench([
-        "inspect-target",
-        "--target-path",
-        targetPath,
-      ]);
+      const target = await runWorkbench(
+        workbenchArgs("inspect-target", { targetPath }),
+      );
       return scanActionResult(
         { target },
         "Validated the local Codex Security target.",
@@ -1083,9 +1063,26 @@ export function createCodexSecurityServer(): McpServer {
       async () => {
         workspace = await runWorkbench(args);
       },
+      async () => {
+        const current = (await runWorkbench(["get-scan", "--scan-id", scanId]))[
+          "workspace"
+        ] as JsonObject;
+        const scan = current["results"];
+        const progress = isJsonObject(scan) ? scan["progress"] : undefined;
+        return {
+          status:
+            isJsonObject(progress) && typeof progress["status"] === "string"
+              ? progress["status"]
+              : undefined,
+          failureMessage:
+            isJsonObject(scan) && typeof scan["failureMessage"] === "string"
+              ? scan["failureMessage"]
+              : undefined,
+        };
+      },
     );
     if (workspace === undefined && canceledLocally) {
-      workspace = (await runWorkbench(["get-scan", "--scan-id", scanId]))[
+      workspace = (await runWorkbench(workbenchArgs("get-scan", { scanId })))[
         "workspace"
       ] as JsonObject;
     }
@@ -1146,7 +1143,7 @@ export function createCodexSecurityServer(): McpServer {
     },
     async ({ scanId }) =>
       scanActionResult(
-        await runWorkbench(["recover-scan-results", "--scan-id", scanId]),
+        await runWorkbench(workbenchArgs("recover-scan-results", { scanId })),
         "Recovered retained Codex Security scan results.",
       ),
   );
@@ -1389,7 +1386,7 @@ export function createCodexSecurityServer(): McpServer {
       _meta: appMeta,
     },
     async ({ scanId, userContext }) => {
-      const current = await runWorkbench(["get-scan", "--scan-id", scanId]);
+      const current = await runWorkbench(workbenchArgs("get-scan", { scanId }));
       const workspace = isJsonObject(current.workspace)
         ? current.workspace
         : undefined;
@@ -1433,7 +1430,7 @@ export function createCodexSecurityServer(): McpServer {
       extra,
     ) => {
       const modelSettings = codexModelSettingsFromExtra(extra);
-      const current = await runWorkbench(["get-scan", "--scan-id", scanId]);
+      const current = await runWorkbench(workbenchArgs("get-scan", { scanId }));
       const scan = isJsonObject(current.scan) ? current.scan : undefined;
       const progress =
         scan && isJsonObject(scan.progress) ? scan.progress : undefined;
@@ -1566,7 +1563,10 @@ export function createCodexSecurityServer(): McpServer {
         `--message=${message}`,
         ...optionalArg("--claim-token", handoffClaimToken),
       ]);
-      deepScanCoordinators.get(scanId)?.failExternallyPersisted(message);
+      const scan = failed["scan"];
+      const progress = isJsonObject(scan) ? scan["progress"] : undefined;
+      if (isJsonObject(progress) && progress["status"] === "failed")
+        deepScanCoordinators.get(scanId)?.failExternallyPersisted(message);
       return scanActionResult(
         failed,
         "Recorded the Codex Security scan failure.",
@@ -1611,15 +1611,13 @@ export function createCodexSecurityServer(): McpServer {
     },
     async ({ occurrenceId, requestId, actionToken }) =>
       scanActionResult(
-        await runWorkbench([
-          "request-finding-remediation",
-          "--occurrence-id",
-          occurrenceId,
-          "--request-id",
-          requestId,
-          "--action-token",
-          actionToken,
-        ]),
+        await runWorkbench(
+          workbenchArgs("request-finding-remediation", {
+            occurrenceId,
+            requestId,
+            actionToken,
+          }),
+        ),
         "Queued the local Codex Security finding remediation request.",
       ),
   );
@@ -1636,19 +1634,15 @@ export function createCodexSecurityServer(): McpServer {
     },
     async ({ occurrenceId, requestId, expectedVersion, action, actionToken }) =>
       scanActionResult(
-        await runWorkbench([
-          "request-finding-remediation-action",
-          "--occurrence-id",
-          occurrenceId,
-          "--request-id",
-          requestId,
-          "--expected-version",
-          String(expectedVersion),
-          "--action",
-          action,
-          "--action-token",
-          actionToken,
-        ]),
+        await runWorkbench(
+          workbenchArgs("request-finding-remediation-action", {
+            occurrenceId,
+            requestId,
+            expectedVersion: String(expectedVersion),
+            action,
+            actionToken,
+          }),
+        ),
         `Queued the local Codex Security finding remediation ${action} request.`,
       ),
   );
@@ -2158,119 +2152,6 @@ function logDeepScanEvent(event: {
   );
 }
 
-interface WorkbenchOptions {
-  isolatedPython?: boolean;
-}
-
-export async function runWorkbench(
-  args: string[],
-  input?: string | Buffer,
-  options: WorkbenchOptions = {},
-): Promise<JsonObject> {
-  let pythonCommand: string | undefined;
-  try {
-    pythonCommand = await resolvePythonCommand();
-    return await executeWorkbench(pythonCommand, args, input, options);
-  } catch (error) {
-    const launchError = pythonCommand
-      ? missingPythonHelperMessage(error, pythonCommand)
-      : undefined;
-    if (launchError) {
-      throw new Error(launchError, { cause: error });
-    }
-    if (isExecError(error) && error.stderr.trim()) {
-      throw new Error(error.stderr.trim(), { cause: error });
-    }
-    throw error;
-  }
-}
-
-async function executeWorkbench(
-  pythonCommand: string,
-  args: string[],
-  input?: string | Buffer,
-  options: WorkbenchOptions = {},
-): Promise<JsonObject> {
-  const timeout = [
-    "begin-deep-scan",
-    "cancel-scan",
-    "fail-scan",
-    "claim-deep-scan-dedup",
-    "commit-deep-scan-dedup",
-    "complete-scan",
-    "export-findings",
-    "finish-deep-scan",
-    "get-scan",
-    "get-deep-scan",
-    "get-workspace",
-    "inspect-setup",
-    "list-findings",
-    "preserve-scan-results",
-    "recover-scan-results",
-    "request-finding-remediation",
-    "request-finding-remediation-action",
-    "save-workspace",
-    "set-finding-triage",
-    "set-finding-remediation",
-    "start-headless-standard-scan",
-    "start-prompt-only-scan",
-    "start-scan",
-    "upsert-deep-scan-worker",
-  ].includes(args[0] ?? "")
-    ? 300_000
-    : 30_000;
-  const execution = execFileAsync(
-    pythonCommand,
-    [
-      ...(options.isolatedPython ? ["-I", "-X", "utf8", "-B"] : []),
-      "-c",
-      WORKBENCH_PYTHON,
-      workbenchScriptPath(),
-    ],
-    {
-      cwd: PLUGIN_ROOT,
-      windowsHide: true,
-      env: process.env,
-      encoding: "utf8" as const,
-      // Artifact bytes are base64-encoded here; retain the existing file-size behavior.
-      maxBuffer: args[0] === "read-artifact" ? Infinity : 4 * 1024 * 1024,
-      timeout,
-    },
-  );
-  execution.child.stdin!.on("error", () => {
-    // The workbench may exit before consuming stdin; surface its process error.
-  });
-  // Match native argv's UTF-8 encoding while framing NUL separately from stdin.
-  execution.child.stdin!.write(
-    `${JSON.stringify(args.map((argument) => argument.toWellFormed()))}\n`,
-  );
-  execution.child.stdin!.end(input);
-  const { stdout } = await execution.catch((error: unknown) => {
-    if (
-      error instanceof Error &&
-      "killed" in error &&
-      error.killed === true &&
-      "signal" in error &&
-      error.signal === "SIGTERM"
-    ) {
-      throw new Error(
-        `Codex Security workbench ${args[0]} timed out after ${timeout / 1000} seconds: ${error.message}`,
-        { cause: error },
-      );
-    }
-    throw error;
-  });
-  const result = JSON.parse(stdout) as unknown;
-  if (!isJsonObject(result)) {
-    throw new Error("Codex Security workbench helper returned invalid JSON.");
-  }
-  return result;
-}
-
-function workbenchScriptPath(): string {
-  return join(PLUGIN_ROOT, "scripts", "workbench_db.py");
-}
-
 function optionalArg(name: string, value: string | undefined): string[] {
   return value ? [`${name}=${value}`] : [];
 }
@@ -2362,15 +2243,6 @@ function codexModelSettingsFromExtra(extra: unknown): {
 function abortSignalFromExtra(extra: unknown): AbortSignal | undefined {
   if (!isJsonObject(extra)) return undefined;
   return extra.signal instanceof AbortSignal ? extra.signal : undefined;
-}
-
-function isExecError(error: unknown): error is { stderr: string } {
-  return Boolean(
-    error &&
-    typeof error === "object" &&
-    "stderr" in error &&
-    typeof error.stderr === "string",
-  );
 }
 
 function failureDiagnostic(error: unknown): string {

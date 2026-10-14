@@ -720,9 +720,14 @@ async function testSettledReducerIsNotStarvedByDiscoveryBacklog() {
 
   await executor.dedupStarted.promise;
   await eventually(
-    () => executor.discoveryCalls >= 8 && executor.runningDiscovery === 4,
+    () =>
+      executor.runningDiscovery > 0 &&
+      [...store.workers.values()].filter(
+        (worker) =>
+          worker.kind === "discovery" && worker.status === "succeeded",
+      ).length === 4,
   );
-  const dispatchedBeforeConvergence = executor.discoveryCalls;
+  const dispatchedBeforeConvergence = coordinator.snapshot().dispatchedCount;
   executor.dedupGate.resolve();
 
   const terminal = await coordinator.wait(undefined, 5_000);
@@ -733,6 +738,45 @@ async function testSettledReducerIsNotStarvedByDiscoveryBacklog() {
     "a settled reducer must stop dispatch before canceled workers can refill the pool",
   );
   assert.equal(executor.discoveryAttempts.size, dispatchedBeforeConvergence);
+}
+
+async function testSlowReducerPausesDiscoveryRefill() {
+  const { fixture, store } = await coordinatorFixture({
+    workers: 4,
+    subagents: 0,
+    stopAfterNoNew: 2,
+    maxDiscoveryRuns: 40,
+  });
+  const executor = new FakeExecutor();
+  executor.dedupGate = Promise.withResolvers<void>();
+  const coordinator = createCoordinator(fixture, store, executor);
+  coordinator.start();
+
+  await executor.dedupStarted.promise;
+  const dispatchedAtReduction = coordinator.snapshot().dispatchedCount;
+  await eventually(
+    () =>
+      [...store.workers.values()].filter(
+        (worker) =>
+          worker.kind === "discovery" && worker.status === "succeeded",
+      ).length >= dispatchedAtReduction,
+  );
+  const dispatchedWhileReducing = coordinator.snapshot().dispatchedCount;
+  executor.dedupGate.resolve();
+
+  const terminal = await coordinator.wait(undefined, 5_000);
+  assert.equal(
+    dispatchedWhileReducing,
+    dispatchedAtReduction,
+    "wait for novelty before refilling discovery",
+  );
+  assert.equal(terminal?.terminalReason, "saturated", terminal?.error);
+  assert.equal(terminal?.dispatchedCount, dispatchedAtReduction);
+  assert.equal(
+    new Set(store.dedupClaims.flatMap((claim) => claim.workerIds)).size,
+    dispatchedAtReduction,
+  );
+  assert.equal(store.run.noNewStreak, dispatchedAtReduction);
 }
 
 async function testSingletonHardCapReduction() {
@@ -3096,12 +3140,14 @@ async function testResumedDiscoveryDeadlineUsesPersistedCreationTime(
 async function testResumedManifestPreservesCompletedReducer(
   includeUnstartedReducer = false,
   removeHistoricalPrompts = true,
+  includePaths?: string[],
 ) {
   const fixture = await fixtureRun({
     workers: 2,
     stopAfterNoNew: 2,
     maxDiscoveryRuns: 3,
   });
+  fixture.run.includePaths = includePaths;
   const store = new FakeStore(fixture.run);
   store.dedupCommitResponseGate = Promise.withResolvers<void>();
   const original = createCoordinator(
@@ -3109,6 +3155,7 @@ async function testResumedManifestPreservesCompletedReducer(
     store,
     new FakeExecutor({
       blockDiscoveryAfterCalls: 2,
+      discoveryCandidateId: includePaths ? "scope-candidate" : undefined,
     }),
     { run: store.run },
   );
@@ -3169,10 +3216,13 @@ async function testResumedManifestPreservesCompletedReducer(
   const persistedWorkers = structuredClone(store.run.persistedWorkers);
   const committedReducer = store.workers.get(store.dedupClaims[0].id)!;
   const committedResult = await readJson(committedReducer.resultManifestPath!);
+  if (includePaths) assert.ok(committedResult.findings.length > 0);
   if (removeHistoricalPrompts) await rm(committedReducer.promptPath);
   const replacementExecutor = new FakeExecutor();
+  const published: ScanDraftInput[] = [];
   const terminal = await runCoordinator(fixture, store, replacementExecutor, {
     run: store.run,
+    onComplete: async (draft) => void published.push(structuredClone(draft)),
   });
   assert.equal(terminal?.status, "succeeded");
   const manifest = await readJson(terminal.manifestPath);
@@ -3185,6 +3235,11 @@ async function testResumedManifestPreservesCompletedReducer(
     "accepted work needs no new worker launch",
   );
   assert.deepEqual(manifest.findings, committedResult.findings);
+  assert.equal(published.length, 1);
+  assert.deepEqual(
+    published[0].findings,
+    includePaths ? [] : committedResult.findings,
+  );
   assert.deepEqual(store.run.persistedDedupInputs, persistedInputs);
   assert.deepEqual(store.run.persistedWorkers, persistedWorkers);
   assert.deepEqual(
@@ -3842,6 +3897,8 @@ async function testSaturationIgnoresDiscoveryCancellationWriteFailure(
 
 async function testPublicationUsesAcceptedReducerSnapshot() {
   const { fixture, store } = await coordinatorFixture();
+  fixture.run.coordinatorGeneration = 3;
+  store.run.coordinatorGeneration = 3;
   const commitDedup = store.commitDedup.bind(store);
   store.commitDedup = async (commit) => {
     const accepted = await commitDedup(commit);
@@ -3858,21 +3915,33 @@ async function testPublicationUsesAcceptedReducerSnapshot() {
     return structuredClone(store.run);
   };
   const completed: ScanDraftInput[] = [];
+  const published: {
+    coordinatorGeneration?: number;
+    resultPath: string | null;
+  }[] = [];
   const terminal = await runCoordinator(
     fixture,
     store,
     new FakeExecutor({ discoveryCandidateId: "accepted-finding" }),
     {
-      onComplete: async (draft) => void completed.push(structuredClone(draft)),
+      onComplete: async (draft, _signal, publication) => {
+        completed.push(structuredClone(draft));
+        published.push(publication);
+      },
     },
   );
   assert.equal(terminal?.status, "succeeded", terminal?.error);
   assert.equal(
-    (completed[0].findings[0].provenance as { candidateId: string })
-      .candidateId,
+    completed[0].findings[0].provenance.candidateId,
     "accepted-finding",
   );
   assert.equal(completed[0].coverage.completeness, "complete");
+  const reducer = [...store.workers.values()].find(
+    (worker) => worker.kind === "dedup",
+  );
+  assert.deepEqual(published, [
+    { coordinatorGeneration: 3, resultPath: reducer!.resultManifestPath },
+  ]);
 }
 
 async function testResumeDoesNotRequireHistoricalWorkerPrompt(
@@ -4151,6 +4220,7 @@ try {
   await testDiscoveryDeadlineBeforeWorkerDispatchReturnsPartialEvidence();
   await testSaturationIgnoresWorkerFailureSettledAfterStop();
   await testSettledReducerIsNotStarvedByDiscoveryBacklog();
+  await testSlowReducerPausesDiscoveryRefill();
   await testSingletonHardCapReduction();
   await testExhaustedRetryFailsScan();
   await testProviderCybersecurityRiskMessagesReplaceRefusedDiscoveryImmediately();
@@ -4224,6 +4294,10 @@ try {
   await testResumedManifestPreservesCompletedReducer(false, false);
   await testResumedManifestPreservesCompletedReducer();
   await testResumedManifestPreservesCompletedReducer(true);
+  await testResumedManifestPreservesCompletedReducer(false, true, [
+    "api",
+    "background jobs",
+  ]);
   await testResumeUsesHistoricalCandidateSnapshotForEachReducer();
   await testPersistedErrorLimitStopsBeforeRescheduling();
   await testPersistedReducerErrorLimitStopsBeforeRescheduling();

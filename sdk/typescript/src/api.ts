@@ -1,4 +1,5 @@
 /// <reference lib="esnext.disposable" preserve="true" />
+import { workbenchArgs } from "./workbench-arguments.js";
 
 import { isSafeNonNegativeInteger as safeInteger } from "./value.js";
 import {
@@ -30,8 +31,9 @@ import {
   type ThreadOptions,
   type TurnOptions,
 } from "@openai/codex-sdk";
-import { z } from "incur";
+import { z } from "zod";
 import { readThreatModelPath } from "./artifact-export.js";
+import { scanSkillConfig } from "./scan-skill-paths.js";
 import { isRecord } from "./record.js";
 import {
   createProfileCodex,
@@ -83,6 +85,7 @@ import {
   type ScanSessionEvent,
   type ScanWorkerEvent,
 } from "./cost.js";
+import type { ScanTokenUsage } from "./cost-model.js";
 import {
   DeepScanProgressTracker,
   type DeepScanProgress,
@@ -196,6 +199,7 @@ import {
   codexSecurityCredentialHome,
   codexSecurityHasStoredFileCredentials,
   codexSecurityStateDirectory,
+  codexExecutableReadPaths,
   createIsolatedHome,
   executablePathForSpawn,
   expandHome,
@@ -314,6 +318,8 @@ export interface ScanOptions extends ScanSettings {
   parentScanId?: string;
   expectedPluginVersion?: string;
   onCost?: (cost: Readonly<ScanCost>, maxCostUsd?: number) => void;
+  /** Observed tokens, including models without a price estimate. */
+  onUsage?: (usage: Readonly<ScanTokenUsage>) => void;
   onBudgetApproaching?: (
     budget: ScanBudget,
   ) => number | undefined | Promise<number | undefined>;
@@ -361,21 +367,19 @@ export interface ValidationOptions extends Pick<
   finding: string | object;
 }
 
-const VALIDATION_DISPOSITIONS = [
-  "reportable",
-  "suppressed",
-  "not_applicable",
-  "deferred",
-] as const;
-
 const validationResponseSchema = z.strictObject({
-  disposition: z.enum(VALIDATION_DISPOSITIONS),
+  disposition: z.enum([
+    "reportable",
+    "suppressed",
+    "not_applicable",
+    "deferred",
+  ]),
   report: z.string().trim().min(1),
 });
 
-export interface ValidationResult {
-  disposition: (typeof VALIDATION_DISPOSITIONS)[number];
-  report: string;
+export interface ValidationResult extends z.infer<
+  typeof validationResponseSchema
+> {
   outputDir: string;
   threadId: string | null;
 }
@@ -425,6 +429,7 @@ export interface ScanBudget {
 type ScanObserverName =
   | "onAuthentication"
   | "onCost"
+  | "onUsage"
   | "onOutputArchived"
   | "onOutputDirReady"
   | "onScanRegistered"
@@ -1029,6 +1034,10 @@ export class CodexSecurity {
         runtime.plugin.pluginRoot,
         ...(knowledgeBase === null ? [] : [knowledgeBase.path]),
       ].filter((path, index, roots) => roots.indexOf(path) === index);
+      const policyFilesystem = policyFilesystemPermissions(
+        inputs.gitMetadataPaths,
+        await codexExecutableReadPaths(this.#codexCommand().command),
+      );
       const { codex } = await this.#createSessionCodex(
         session,
         "policy",
@@ -1044,12 +1053,10 @@ export class CodexSecurity {
         options.auth,
         undefined,
         policyCodexConfig(session.sessionConfig),
-        inputs.gitMetadataPaths.length === 0
-          ? []
-          : [
-              // CLI override keys split on dots, so keep paths inside the TOML value.
-              `permissions.${POLICY_PERMISSION_PROFILE}.filesystem=${inlineToml(policyFilesystemPermissions(inputs.gitMetadataPaths))}`,
-            ],
+        [
+          // CLI override keys split on dots, so keep paths inside the TOML value.
+          `permissions.${POLICY_PERMISSION_PROFILE}.filesystem=${inlineToml(policyFilesystem)}`,
+        ],
       );
       const reportCost = (current: Readonly<ScanCost>): void => {
         const total = addScanCosts(accumulatedCost, current);
@@ -1577,6 +1584,10 @@ export class CodexSecurity {
         repository: repo,
         scanDirectory: scanDir,
         maxCostUsd: options.maxCostUsd,
+        onUsage:
+          options.onUsage === undefined
+            ? undefined
+            : (usage) => notifyObserver(options, "onUsage")(usage),
         onActivity:
           options.onActivity === undefined
             ? undefined
@@ -1641,13 +1652,10 @@ export class CodexSecurity {
                     }
                     await workbench(
                       { ...activeScan.options, signal: budgetSignal },
-                      [
-                        "set-scan-cost-limit",
-                        "--scan-id",
-                        activeScan.id,
-                        "--max-cost-usd",
-                        String(next),
-                      ],
+                      workbenchArgs("set-scan-cost-limit", {
+                        scanId: activeScan.id,
+                        maxCostUsd: String(next),
+                      }),
                     );
                     if (budgetSignal.aborted) return;
                     maxCostUsd = next;
@@ -1714,20 +1722,13 @@ export class CodexSecurity {
             ])
           : await workbench(
               workbenchOptions,
-              [
-                "register-cli-scan",
-                "--repository",
-                repo,
-                "--scan-dir",
+              workbenchArgs("register-cli-scan", {
+                repository: repo,
                 scanDir,
-                "--registration-json-stdin",
-                ...(options.archiveExisting === true
-                  ? ["--archive-existing"]
-                  : []),
-                ...(options.parentScanId === undefined
-                  ? []
-                  : ["--parent-scan-id", options.parentScanId]),
-              ],
+                registrationJsonStdin: true,
+                archiveExisting: options.archiveExisting === true,
+                parentScanId: options.parentScanId,
+              }),
               JSON.stringify({
                 recipe,
                 userContext: options.scanPrompt,
@@ -1878,7 +1879,7 @@ export class CodexSecurity {
                 ...workbenchOptions,
                 signal: AbortSignal.any([signal, progressSignal]),
               },
-              ["get-scan", "--scan-id", scanId],
+              workbenchArgs("get-scan", { scanId }),
             ),
           onProgress: (progress) =>
             notifyObserver(options, "onDeepProgress")(progress),
@@ -2087,6 +2088,7 @@ export class CodexSecurity {
         events,
         signal,
         scanDir,
+        scanId,
         pluginRoot: runtime.plugin.installedRoot,
         pythonPath: session.python,
         protectedRoot,
@@ -2118,13 +2120,10 @@ export class CodexSecurity {
           if (budgetRecovery !== null) budgetRecovery.threadId = threadId;
           tracker.start(threadId);
           try {
-            await workbench(workbenchOptions, [
-              "set-scan-thread",
-              "--scan-id",
-              scanId,
-              "--thread-id",
-              threadId,
-            ]);
+            await workbench(
+              workbenchOptions,
+              workbenchArgs("set-scan-thread", { scanId, threadId }),
+            );
           } catch (error) {
             notifyObserver(
               options,
@@ -2206,17 +2205,15 @@ export class CodexSecurity {
           completionCost = snapshot.cost;
           let preparation: JsonObject;
           try {
-            preparation = await workbench(workbenchOptions, [
-              "prepare-scan-completion",
-              "--scan-id",
-              scanId,
-            ]);
+            preparation = await workbench(
+              workbenchOptions,
+              workbenchArgs("prepare-scan-completion", { scanId }),
+            );
           } catch (error) {
-            const saved = await workbench(workbenchOptions, [
-              "get-scan",
-              "--scan-id",
-              scanId,
-            ]).catch(() => null);
+            const saved = await workbench(
+              workbenchOptions,
+              workbenchArgs("get-scan", { scanId }),
+            ).catch(() => null);
             const savedScan = isRecord(saved) ? saved["scan"] : undefined;
             const progress = isRecord(savedScan)
               ? savedScan["progress"]
@@ -2340,6 +2337,7 @@ export class CodexSecurity {
             events: (await followUp()).events,
             signal,
             scanDir,
+            scanId,
             pluginRoot: runtime.plugin.installedRoot,
             pythonPath: session.python,
             protectedRoot,
@@ -2776,10 +2774,7 @@ export class CodexSecurity {
     await this.close();
   }
 
-  async #authentication(): Promise<{
-    codexHome: string;
-    environment: Record<string, string>;
-  }> {
+  async #authentication() {
     this.#requireOpen();
     const environment = selectedScanEnvironment(
       this.#runtime?.environment ?? this.#dependencies.environment,
@@ -3035,9 +3030,10 @@ export class CodexSecurity {
         );
       }
       const runtime = this.#runtime;
-      const effectiveConfig = scanCyberAccessConfig(
-        requestedConfig,
-        options.cyberAccessProgram,
+      const effectiveConfig = await scanSkillConfig(
+        scanCyberAccessConfig(requestedConfig, options.cyberAccessProgram),
+        runtime.plugin,
+        runtime.codexHome,
       );
       const approvalPolicy = scanApprovalPolicy(effectiveConfig);
       const preflightConfig = scanPreflightCodexConfig(effectiveConfig);
@@ -3381,18 +3377,13 @@ export class CodexSecurity {
       throwIfAborted(signal, scanDir);
       const registration = await workbench(
         workbenchOptions,
-        [
-          "register-cli-scan",
-          "--repository",
-          local.repository,
-          "--scan-dir",
+        workbenchArgs("register-cli-scan", {
+          repository: local.repository,
           scanDir,
-          "--registration-json-stdin",
-          ...(options.archiveExisting ? ["--archive-existing"] : []),
-          ...(options.parentScanId === undefined
-            ? []
-            : ["--parent-scan-id", options.parentScanId]),
-        ],
+          registrationJsonStdin: true,
+          archiveExisting: Boolean(options.archiveExisting),
+          parentScanId: options.parentScanId,
+        }),
         JSON.stringify({
           recipe: {
             ...scanRecipe({
@@ -3460,11 +3451,10 @@ export class CodexSecurity {
         output_tokens: 0,
       };
       const cost = estimateScanCost(model, usage);
-      await workbench(workbenchOptions, [
-        "prepare-scan-completion",
-        "--scan-id",
-        scanId,
-      ]);
+      await workbench(
+        workbenchOptions,
+        workbenchArgs("prepare-scan-completion", { scanId }),
+      );
       const completion = await workbench(workbenchOptions, [
         "complete-scan",
         "--scan-id",
@@ -3857,6 +3847,7 @@ async function removeTargetPathsFile(path: string | null): Promise<void> {
 }
 
 interface ScanEventRunOptions extends Pick<ScanOptions, "onReconnect"> {
+  scanId?: string;
   thread: Pick<CodexThreadLike, "id">;
   events: AsyncGenerator<ScanEvent>;
   signal: AbortSignal;
@@ -3887,6 +3878,7 @@ export async function runScanEvents(
   let scanStarted = false;
   let tacStatusReported = false;
   try {
+    options.signal.throwIfAborted();
     const turn = await readCodexTurn({
       thread: options.thread,
       events: options.events,
@@ -3958,7 +3950,44 @@ export async function runScanEvents(
         "Codex Security did not report a thread ID.",
       );
     }
-    if (options.onFinalize !== undefined) {
+    // Managed scans reconcile saved checkpoints before admitting canonical artifacts.
+    if (options.workbenchValidated && options.onFinalize !== undefined) {
+      usage = (await options.onFinalize(usage)) ?? usage;
+    }
+    options.signal.throwIfAborted();
+    await requireScanArtifacts(
+      options.scanDir,
+      ["scan-manifest.json", "findings.json", "coverage.json"],
+      options.signal,
+    );
+    const [manifest, findings, coverage] = await Promise.all(
+      ["scan-manifest.json", "findings.json", "coverage.json"].map(
+        async (name) =>
+          JSON.parse(
+            new TextDecoder("utf-8", { fatal: true }).decode(
+              await readScanFile(options.scanDir, name, name, options.signal),
+            ),
+          ),
+      ),
+    );
+    const helper = (
+      await import(
+        pathToFileURL(join(await bundledPluginRoot(), "mcp/helpers.mjs")).href
+      )
+    ).default;
+    const draft = helper.parseCanonicalScanDraft({
+      scanId: options.scanId ?? manifest.scan.id,
+      manifest,
+      findings,
+      coverage,
+    });
+    options.signal.throwIfAborted();
+    if (draft.complete === false) {
+      throw new IncompleteScanError(
+        "Codex Security produced only an unfinished audit checkpoint.",
+      );
+    }
+    if (!options.workbenchValidated && options.onFinalize !== undefined) {
       usage = (await options.onFinalize(usage)) ?? usage;
     }
     const result = await collectResult(
@@ -4137,8 +4166,10 @@ function scanPrompt(
   const python = pluginPythonCommand();
   const customValidation = discoveryPrompt !== undefined;
   return [
+    "Use [$codex-security](mcp://codex-security) for this scan's artifact tools.",
     discoveryPrompt ??
-      `Use the installed $codex-security:${skillName} skill at ${shellEnvironmentReference("CODEX_SECURITY_PLUGIN_ROOT", `/skills/${skillName}/SKILL.md`)}.`,
+      `Read ${shellEnvironmentReference("CODEX_SECURITY_PLUGIN_ROOT", `/skills/${skillName}/SKILL.md`)} and follow that ${skillName} workflow. Resolve all of its plugin-relative references and helpers from ${shellEnvironmentReference("CODEX_SECURITY_PLUGIN_ROOT")}. This is the readable copy of the selected plugin; its installed cache under CODEX_HOME is intentionally denied.`,
+    `For a Codex Security skill invoked by the assigned workflow, remove any codex-security: prefix from its name, read ${shellEnvironmentReference("CODEX_SECURITY_PLUGIN_ROOT", "/skills/<skill-name>/SKILL.md")}, and follow that file. Resolve its relative references from its directory. Give delegated workers the same readable skill paths. Load only skills required by the assigned workflow.`,
     "Run this Codex Security scan non-interactively.",
     ...(modelProvider === "amazon-bedrock"
       ? [
@@ -4348,23 +4379,11 @@ function addScanCosts(
   };
 }
 
-async function collectResult(
-  turnResult: TurnResultMetadata,
-  threadId: string,
+async function requireScanArtifacts(
   scanDir: string,
-  pluginRoot: string,
-  expectation: ScanExpectation,
+  required: readonly string[],
   signal: AbortSignal,
-  workbenchValidated = false,
-  pythonPath?: string,
-  protectedRoot?: string,
-): Promise<ScanResult> {
-  const required = [
-    "scan-manifest.json",
-    "findings.json",
-    "coverage.json",
-    "report.md",
-  ];
+): Promise<void> {
   const missing: string[] = [];
   for (const name of required) {
     try {
@@ -4383,7 +4402,25 @@ async function collectResult(
       `Codex Security scan completed without required artifacts: ${missing.join(", ")}`,
     );
   }
-  const { manifest, findings, coverage } = await loadContract(scanDir, {
+}
+
+async function collectResult(
+  turnResult: TurnResultMetadata,
+  threadId: string,
+  scanDir: string,
+  pluginRoot: string,
+  expectation: ScanExpectation,
+  signal: AbortSignal,
+  workbenchValidated = false,
+  pythonPath?: string,
+  protectedRoot?: string,
+): Promise<ScanResult> {
+  await requireScanArtifacts(
+    scanDir,
+    ["scan-manifest.json", "findings.json", "coverage.json", "report.md"],
+    signal,
+  );
+  const contract = await loadContract(scanDir, {
     pluginRoot,
     expectation,
     workbenchValidated,
@@ -4401,9 +4438,7 @@ async function collectResult(
     if (signal.aborted) throw signal.reason ?? error;
   }
   return new ScanResult({
-    manifest,
-    findings,
-    coverage,
+    ...contract,
     scanDir,
     threadId,
     turnResult,
@@ -4734,10 +4769,13 @@ export function scanRuntimeCodexConfig(
 
 function policyFilesystemPermissions(
   gitMetadataPaths: readonly string[] = [],
+  codexPaths: readonly string[] = [],
 ): JsonObject {
   return {
     ":minimal": "read",
     ":workspace_roots": "read",
+    // Linux's sandbox re-executes Codex, including installations outside /usr.
+    ...Object.fromEntries(codexPaths.map((path) => [path, { ".": "read" }])),
     // A scoped "." keeps native permission paths literal, including glob characters.
     ...Object.fromEntries(
       gitMetadataPaths.map((path) => [path, { ".": "deny" }]),
@@ -4862,6 +4900,18 @@ export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
     }
     const features = capabilityFeatures(source["features"]);
     if (Object.keys(features).length > 0) result["features"] = features;
+    const skills = source["skills"];
+    if (isRecord(skills) && Array.isArray(skills["config"])) {
+      result["skills"] = {
+        config: skills["config"].flatMap((entry) =>
+          isRecord(entry) &&
+          safeString(entry["path"]) &&
+          typeof entry["enabled"] === "boolean"
+            ? [{ path: entry["path"], enabled: entry["enabled"] }]
+            : [],
+        ),
+      };
+    }
     const agents = source["agents"];
     if (isRecord(agents)) {
       const sanitized: JsonObject = {};
@@ -5054,6 +5104,7 @@ function selectedWorkerRuntimeConfig(
         "model_instructions_file",
         "model_verbosity",
         "shell_environment_policy",
+        "skills",
         "web_search",
         "windows",
       ]

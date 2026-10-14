@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   accessSync,
   constants as fsConstants,
@@ -31,6 +32,7 @@ import {
   profileConfigOverrides,
 } from "../../../scripts/codex_profile.mjs";
 import { executablePathForSpawn } from "./executable-path.js";
+import { writePrivateFile } from "./artifacts.js";
 import {
   classifyCodexWorkerError,
   DeepScanNonRetryableError,
@@ -61,6 +63,8 @@ export interface CodexSdkWorkerArtifactContext {
   repoRoot: string;
   scanId: string;
   scope?: string;
+  includePaths?: readonly string[];
+  filePaths?: readonly string[];
   pythonCommand?: string;
 }
 
@@ -80,6 +84,15 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
   ) {}
 
   async run(request: CodexWorkerRequest): Promise<CodexWorkerResult> {
+    const includePaths = this.modelSettings.artifactContext?.includePaths;
+    const scopeInput = JSON.stringify({
+      paths: includePaths,
+      filePaths: this.modelSettings.artifactContext?.filePaths ?? [],
+    });
+    const includePathsFile =
+      includePaths === undefined
+        ? undefined
+        : resolve(dirname(request.promptPath), `scope-${randomUUID()}.json`);
     try {
       const parentSandbox = this.modelSettings.parentSandbox;
       if (!parentSandbox) {
@@ -103,6 +116,10 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         }
         childEnv[name] = value;
       }
+      if (includePathsFile !== undefined) {
+        // Keep host-bound inputs beside the prompt, outside the worker's output root.
+        await writePrivateFile(includePathsFile, scopeInput);
+      }
       // Keep one native configuration for the policy check and the worker turn.
       // Worker-owned tool and permission settings take precedence over inheritance.
       const configOverrides = profileConfigOverrides({
@@ -113,7 +130,7 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         mcp_servers: {
           // A disabled server still needs a valid transport during native resolution.
           "codex-security": { command: "node", enabled: false },
-          ...this.compactArtifactServer(request),
+          ...this.compactArtifactServer(request, includePathsFile),
         },
         ...workerSubagentConfig(
           request.subagents,
@@ -179,9 +196,13 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
       const thread = request.resumeThreadId
         ? codex.resumeThread(request.resumeThreadId, threadOptions)
         : codex.startThread(threadOptions);
-      const input = request.resumeThreadId
+      const workerPrompt = request.resumeThreadId
         ? (request.continuationPrompt ?? prompt)
         : prompt;
+      const pluginRoot = this.modelSettings.artifactContext?.pluginRoot;
+      const input = pluginRoot
+        ? `${workerPrompt}\n\nFor a Codex Security skill invoked by the assigned workflow, remove any codex-security: prefix from its name and read <skill-name>/SKILL.md beneath ${JSON.stringify(join(pluginRoot, "skills"))}. Follow that file and resolve its relative references from its directory. Give delegated workers the same readable skill paths. Load only skills required by the assigned workflow; this does not expand the worker's assigned role.`
+        : workerPrompt;
       const controller = new AbortController();
       const forwardAbort = () => controller.abort(request.signal.reason);
       if (request.signal.aborted) {
@@ -242,10 +263,16 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
       }
     } catch (error) {
       throw classifyCodexWorkerError(error);
+    } finally {
+      if (includePathsFile !== undefined)
+        await fs.rm(includePathsFile, { force: true });
     }
   }
 
-  private compactArtifactServer(request: CodexWorkerRequest): Record<
+  private compactArtifactServer(
+    request: CodexWorkerRequest,
+    includePathsFile?: string,
+  ): Record<
     string,
     {
       command: string;
@@ -298,6 +325,9 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
           ...(scan.scope !== undefined
             ? { CODEX_SECURITY_SCOPE: scan.scope }
             : {}),
+          ...(includePathsFile === undefined
+            ? {}
+            : { CODEX_SECURITY_INCLUDE_PATHS_FILE: includePathsFile }),
           ...(scan.pythonCommand !== undefined
             ? { CODEX_SECURITY_PYTHON_COMMAND: scan.pythonCommand }
             : {}),
@@ -519,6 +549,7 @@ async function workerRuntimeSettings(
       "service_tier",
       "analytics",
       "responses_api_metadata",
+      "skills",
     ].map((key) => [key, selected[key]]),
   );
   const settings: CodexSdkWorkerRuntimeSettings = { config: inherited };

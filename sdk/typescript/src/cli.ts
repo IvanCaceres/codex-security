@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { workbenchArgs } from "./workbench-arguments.js";
 import { listenForAbort } from "./cli-signals.js";
 import { isNonEmptyString, parseJson } from "./value.js";
 
@@ -60,6 +61,7 @@ import {
 } from "./artifact-export.js";
 export { exportEnvironment } from "./artifact-export.js";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
+import { parse as parseYaml } from "yaml";
 import {
   classifyConnectionFailure,
   CodexSecurity,
@@ -144,6 +146,7 @@ import {
   formatScanCost,
   formatScanCostTokens,
   formatTokenUsage,
+  type ScanTokenUsage,
 } from "./cost-model.js";
 import { readRegularInputFile, resolveScanPrompts } from "./prompt-files.js";
 import {
@@ -373,6 +376,8 @@ const PROVIDER_OPTION = z
   .enum(["openai", "openrouter", "fireworks", "amazon-bedrock"])
   .default("openai")
   .describe("Inference provider for scans.");
+const positiveInteger = z.number().int().positive();
+
 const SHOW_COST_OPTION = z
   .boolean()
   .default(false)
@@ -1748,12 +1753,8 @@ export async function main(
   const frameworkCapture = captureOutput();
   let rawExportOutput = false;
   let streamedLogs: Awaited<ReturnType<typeof readSavedScanLogs>> | undefined;
-  let renderedHistory: string | undefined;
-  let renderedPublication: string | undefined;
-  let renderedPolicy: string | undefined;
-  let renderedPatch: string | undefined;
-  let patchStructuredError = false;
-  let scanStructuredError = false;
+  let renderedOutput: string | undefined;
+  let structuredError = false;
   let incompleteScanOutput:
     { format: "json" | "jsonl"; message: string } | undefined;
   const recordIncompleteScanOutput = (outcome: ScanOutcome, format: string) => {
@@ -1767,7 +1768,6 @@ export async function main(
   };
   let filteredScanFailure:
     { format: string; data: Record<string, unknown> } | undefined;
-  let renderedScanFailure: string | undefined;
   const finishScan = (
     outcome: ScanOutcome,
     format: string,
@@ -1792,7 +1792,7 @@ export async function main(
         return data;
       }
       // Incur would wrap returned data in an ok: true envelope.
-      scanStructuredError = true;
+      structuredError = true;
       return incurError({ code, message, exitCode });
     }
     return incurError({ code, message: outcome.error, exitCode });
@@ -1821,14 +1821,11 @@ export async function main(
     pythonPath?: string,
   ): Promise<SavedScan[] | undefined> => {
     const result = await history(
-      [
-        "list-scans",
-        "--repository",
-        dependencies.currentDirectory(),
-        ...(status === "complete" ? ["--status", "complete"] : []),
-        "--limit",
-        String(count),
-      ],
+      workbenchArgs("list-scans", {
+        repository: dependencies.currentDirectory(),
+        status: status === "complete" ? "complete" : undefined,
+        limit: String(count),
+      }),
       (value) => {
         if ((value["scans"] as SavedScan[]).length < count) {
           const kind = status === "complete" ? "completed" : "saved";
@@ -1900,14 +1897,11 @@ export async function main(
     runMatching(async (options) => {
       const { matchingCached, matchingInputs, ...comparison } =
         await dependencies.runWorkbench(
-          [
-            "compare-scans",
-            "--before-scan-id",
-            beforeId,
-            "--after-scan-id",
-            afterId,
-            "--include-matching-inputs",
-          ],
+          workbenchArgs("compare-scans", {
+            beforeScanId: beforeId,
+            afterScanId: afterId,
+            includeMatchingInputs: true,
+          }),
           undefined,
           options.signal,
         );
@@ -1916,14 +1910,11 @@ export async function main(
       const matching = await dependencies.matchFindings(input, options);
       options.signal?.throwIfAborted();
       return await dependencies.runWorkbench(
-        [
-          "save-scan-comparison",
-          "--before-scan-id",
-          beforeId,
-          "--after-scan-id",
-          afterId,
-          "--matches-json-stdin",
-        ],
+        workbenchArgs("save-scan-comparison", {
+          beforeScanId: beforeId,
+          afterScanId: afterId,
+          matchesJsonStdin: true,
+        }),
         JSON.stringify(matching),
         options.signal,
       );
@@ -1946,7 +1937,7 @@ export async function main(
     ) {
       return result;
     }
-    renderedHistory = renderScanHistory(result, command, {
+    renderedOutput = renderScanHistory(result, command, {
       columns: output.columns,
       color:
         dependencies.environment["NO_COLOR"] === undefined &&
@@ -2067,12 +2058,15 @@ export async function main(
                     dependencies.runWorkbench,
                     target["targetId"] as string,
                   );
-            return { repository, findings: findings ?? [] };
+            return {
+              repository: requestedRepository,
+              findings: findings ?? [],
+            };
           },
         ),
         "findings",
         format,
-        { repository },
+        { repository: requestedRepository },
       );
     },
   });
@@ -2110,11 +2104,12 @@ export async function main(
             ? undefined
             : resolveCliPath(directory, args.repository ?? directory);
         return presentHistory(
-          await history([
-            "list-scans",
-            ...(repository === undefined ? [] : ["--repository", repository]),
-            ...(scanRoot === undefined ? [] : ["--scan-root", scanRoot]),
-          ]),
+          await history(
+            workbenchArgs("list-scans", {
+              repository,
+              scanRoot,
+            }),
+          ),
           "list",
           format,
           {
@@ -2275,11 +2270,9 @@ export async function main(
       async run({ args, error: incurError, format, options }) {
         let scanArguments: ScanArguments;
         try {
-          const saved = await dependencies.runWorkbench([
-            "get-cli-scan-resume",
-            "--scan-id",
-            args.scanId,
-          ]);
+          const saved = await dependencies.runWorkbench(
+            workbenchArgs("get-cli-scan-resume", { scanId: args.scanId }),
+          );
           if (
             typeof saved["scanId"] !== "string" ||
             typeof saved["scanDir"] !== "string"
@@ -2391,11 +2384,9 @@ export async function main(
         let scanArguments: ScanArguments;
         try {
           const { recipe, scanId: resolvedScanId } =
-            await dependencies.runWorkbench([
-              "get-scan-recipe",
-              "--scan-id",
-              scanId,
-            ]);
+            await dependencies.runWorkbench(
+              workbenchArgs("get-scan-recipe", { scanId }),
+            );
           const parentScanId = resolvedScanId as string;
           if (
             isJsonObject(recipe) &&
@@ -2861,11 +2852,9 @@ export async function main(
               `Interactive scan selection requires a terminal. Select a saved scan: codex-security publish scan --scan SCAN_ID --to ${options.to}${options.to === "linear" ? " --linear-team TEAM_ID" : ""}.`,
             );
           }
-          const saved = await scanDependencies.runWorkbench([
-            "list-scans",
-            "--status",
-            "complete",
-          ]);
+          const saved = await scanDependencies.runWorkbench(
+            workbenchArgs("list-scans", { status: "complete" }),
+          );
           const listedScans = saved["scans"];
           if (!Array.isArray(listedScans)) {
             throw new CodexSecurityError(
@@ -3180,7 +3169,7 @@ export async function main(
           !options.dryRun &&
           !argv.some((argument) => OUTPUT_OPTION.test(argument))
         ) {
-          renderedPublication = renderPublicationSummary(
+          renderedOutput = renderPublicationSummary(
             result,
             output.isTTY === true &&
               dependencies.environment["NO_COLOR"] === undefined &&
@@ -3268,7 +3257,7 @@ export async function main(
         z.object({
           source: z.literal("github-code-scanning"),
           repository: z.string(),
-          number: z.number().int().positive(),
+          number: positiveInteger,
           url: z.string(),
           alert: z.record(z.string(), z.unknown()),
         }),
@@ -3336,7 +3325,7 @@ export async function main(
     },
   })
     .command("policy", {
-      description: "Draft SECURITY.md guidance for review.",
+      description: "Draft SECURITY.md for review.",
       destructive: true,
       mcp: false,
       args: z.object({
@@ -3367,11 +3356,11 @@ export async function main(
         headless: z
           .boolean()
           .default(false)
-          .describe("Skip owner questions and authentication prompts."),
+          .describe("Skip questions and sign-in prompts."),
         dryRun: z
           .boolean()
           .default(false)
-          .describe("Validate local generation inputs without starting Codex."),
+          .describe("Check inputs without generating a policy."),
         auth: SKILL_AUTH_OPTION,
         ...MODEL_OPTIONS.shape,
         provider: PROVIDER_OPTION.describe(
@@ -3387,7 +3376,9 @@ export async function main(
         { args: { repository: "." }, options: { path: "services/api" } },
       ],
       hint:
-        "Save a draft for review:\n" +
+        "Review the diff and notes. Edit the draft, then copy only SECURITY.md to the Policy target shown.\n" +
+        "Your existing policy stays unchanged until you replace it.\n\n" +
+        "Save a draft without answering questions:\n" +
         "  codex-security policy . --headless --output-dir /path/outside/repository/policy --json",
       output: z
         .union([z.record(z.string(), z.unknown()), z.string()])
@@ -3485,7 +3476,7 @@ export async function main(
             outcome.markdown !== undefined &&
             !filterOutput
           ) {
-            if (!transformOutput) renderedPolicy = outcome.markdown;
+            if (!transformOutput) renderedOutput = outcome.markdown;
             return outcome.markdown;
           }
           return format === "toon" && !explicitOutput && !options.dryRun
@@ -4001,10 +3992,7 @@ export async function main(
       destructive: true,
       mcp: false,
       options: z.object({
-        concurrency: z
-          .number()
-          .int()
-          .positive()
+        concurrency: positiveInteger
           .default(DEFAULT_DEDUPE_CONCURRENCY)
           .describe(
             "Maximum concurrent dedupe jobs across Luna and Sol; use 1 for serial execution.",
@@ -4225,10 +4213,7 @@ export async function main(
           outputDir: optionValue("--output-dir")
             .optional()
             .describe("Empty results directory outside the repository."),
-          workers: z
-            .number()
-            .int()
-            .positive()
+          workers: positiveInteger
             .default(4)
             .describe(
               "Concurrent component scans; deep workers are configured per scan.",
@@ -4464,10 +4449,7 @@ export async function main(
           .optional()
           .meta({ default: [] })
           .describe("Read shared security docs for every repository."),
-        workers: z
-          .number()
-          .int()
-          .positive()
+        workers: positiveInteger
           .default(4)
           .describe(
             "Concurrent repository scans. Per-scan Codex workers are separate.",
@@ -4490,10 +4472,7 @@ export async function main(
           `OpenAI model for each repository (default: ${DEFAULT_SCAN_MODEL_CONFIGURATION.model}).`,
         ).shape,
         provider: PROVIDER_OPTION,
-        maxAttempts: z
-          .number()
-          .int()
-          .positive()
+        maxAttempts: positiveInteger
           .default(1)
           .describe("Maximum scan attempts per repository."),
         maxCost: ScanSettingsSchema.shape.maxCostUsd.describe(
@@ -4629,7 +4608,7 @@ export async function main(
               ? {
                   recoverScan: async (scanDir, prompts) => {
                     const history = await dependencies.runWorkbench(
-                      ["list-scans", "--scan-root", scanDir],
+                      workbenchArgs("list-scans", { scanRoot: scanDir }),
                       undefined,
                       controller.signal,
                     );
@@ -4655,12 +4634,10 @@ export async function main(
                     if (status !== "running" || scan["mode"] !== "deep")
                       return undefined;
                     const saved = await dependencies.runWorkbench(
-                      [
-                        "get-cli-scan-resume",
-                        "--scan-id",
-                        scan.scanId,
-                        "--allow-unavailable",
-                      ],
+                      workbenchArgs("get-cli-scan-resume", {
+                        scanId: scan.scanId,
+                        allowUnavailable: true,
+                      }),
                       undefined,
                       controller.signal,
                     );
@@ -5480,14 +5457,14 @@ export async function main(
           const message = errorMessage(error);
           errorOutput.write(`codex-security: ${diagnosticValue(message)}\n`);
           if (!structuredOutput) return;
-          patchStructuredError = true;
+          structuredError = true;
           const failure = {
             code:
               error instanceof PatchCommandError ? error.code : "PATCH_FAILED",
             message,
           };
           if (!fullOutput) {
-            renderedPatch =
+            renderedOutput =
               JSON.stringify({
                 ok: false,
                 ...patchResult,
@@ -5694,11 +5671,11 @@ export async function main(
       async run({ args, options }) {
         let scanId = args.scanId;
         if (scanId === undefined) {
-          const value = await history([
-            "list-scans",
-            "--repository",
-            dependencies.currentDirectory(),
-          ]);
+          const value = await history(
+            workbenchArgs("list-scans", {
+              repository: dependencies.currentDirectory(),
+            }),
+          );
           const scans = value["scans"] as {
             scanId: string;
             startedAt: string;
@@ -6177,12 +6154,12 @@ export async function main(
         stdout: failureOutput.stream.write,
         exit: () => undefined,
       });
-    renderedScanFailure = failureOutput.text();
+    renderedOutput = failureOutput.text();
   }
   let frameworkOutput = frameworkCapture.text();
   if (notice !== undefined) errorOutput.write(formatUpdateNotice(notice));
   if (frameworkExit !== undefined) {
-    if (policyFullOutput || patchStructuredError || scanStructuredError) {
+    if (policyFullOutput || structuredError) {
       if (exitCode === 0) exitCode = 2;
     } else {
       if (exitCode !== 0) return exitCode;
@@ -6196,7 +6173,7 @@ export async function main(
   if (
     frameworkOutput.length === 0 &&
     streamedLogs === undefined &&
-    renderedScanFailure === undefined
+    filteredScanFailure === undefined
   )
     return exitCode;
   try {
@@ -6229,11 +6206,7 @@ export async function main(
     await writeCliOutput(
       output,
       logOutput ??
-        renderedScanFailure ??
-        renderedPolicy ??
-        renderedPatch ??
-        renderedPublication ??
-        renderedHistory ??
+        renderedOutput ??
         formatCliHelp(frameworkOutput, output.columns),
     );
     return exitCode;
@@ -6526,12 +6499,10 @@ async function matchAllScans(
   options: ScanComparisonOptions = {},
 ): Promise<JsonObject> {
   const result = (await dependencies.runWorkbench(
-    [
-      "list-unmatched-scan-pairs",
-      "--repository",
-      dependencies.currentDirectory(),
-      ...(force ? ["--force"] : []),
-    ],
+    workbenchArgs("list-unmatched-scan-pairs", {
+      repository: dependencies.currentDirectory(),
+      force: Boolean(force),
+    }),
     undefined,
     options.signal,
   )) as MatchingPlan;
@@ -6574,14 +6545,11 @@ async function matchAllScans(
     for (const { scanId, comparison } of comparisons) {
       options.signal?.throwIfAborted();
       await dependencies.runWorkbench(
-        [
-          "save-scan-comparison",
-          "--before-scan-id",
-          scanId,
-          "--after-scan-id",
+        workbenchArgs("save-scan-comparison", {
+          beforeScanId: scanId,
           afterScanId,
-          "--matches-json-stdin",
-        ],
+          matchesJsonStdin: true,
+        }),
         JSON.stringify(comparison),
         options.signal,
       );
@@ -6663,13 +6631,9 @@ async function selectSavedFindings(
   let scanId = requestedScanId;
   if (scanId === "latest") {
     const repository = resolve(dependencies.currentDirectory());
-    const history = await dependencies.runWorkbench([
-      "list-scans",
-      "--repository",
-      repository,
-      "--status",
-      "complete",
-    ]);
+    const history = await dependencies.runWorkbench(
+      workbenchArgs("list-scans", { repository, status: "complete" }),
+    );
     const latest = (history["scans"] as { scanId?: string }[] | undefined)?.[0]
       ?.scanId;
     if (typeof latest !== "string") {
@@ -6847,6 +6811,9 @@ async function publishPatchBranch(
             gitlabHost.includes("://") ? gitlabHost : `https://${gitlabHost}`,
           ));
     const command = gitlab ? "glab" : "gh";
+    const gitlabRepository = remote.includes("://")
+      ? remote
+      : `ssh://${remote.replace(":", "/")}`;
     let url = await run(
       command,
       gitlab
@@ -6859,9 +6826,9 @@ async function publishPatchBranch(
             "--output",
             "json",
             "--jq",
-            ".[0].web_url // empty",
+            "map(select(.source_project_id == .target_project_id))[0].web_url // empty",
             "--repo",
-            remote,
+            gitlabRepository,
           ]
         : [
             "pr",
@@ -6886,16 +6853,16 @@ async function publishPatchBranch(
               "create",
               "--draft",
               "--head",
-              remote,
+              gitlabRepository,
               "--source-branch",
               branch,
               "--title",
               PATCH_PR_TITLE,
               "--description",
-              body,
+              gitlabPatchDescription(body),
               "--yes",
               "--repo",
-              remote,
+              gitlabRepository,
             ]
           : [
               "pr",
@@ -6920,6 +6887,16 @@ async function publishPatchBranch(
     );
     throw error;
   }
+}
+
+function gitlabPatchDescription(body: string): string {
+  // GitLab ignores quick actions inside its native fenced blockquotes. Choose
+  // a fence the report cannot close after quick-action CR removal; preserve its
+  // original bytes and end the outer quote at EOF.
+  let fenceLength = 3;
+  for (const match of body.replaceAll("\r", "").matchAll(/^[ \t]*(>+)/gmu))
+    fenceLength = Math.max(fenceLength, match[1]!.length + 1);
+  return `${">".repeat(fenceLength)}\n${body}`;
 }
 
 function patchRemoteHost(remote: string): string | undefined {
@@ -7388,10 +7365,9 @@ async function runFindingPatches(
           : [];
         const matches = entries.filter(
           (entry) =>
-            typeof entry === "object" &&
-            entry !== null &&
+            isJsonObject(entry) &&
             "occurrenceId" in entry &&
-            entry.occurrenceId === finding.occurrenceId,
+            entry["occurrenceId"] === finding.occurrenceId,
         );
         const parsed = findingPatchSchema.safeParse(matches[0]);
         if (matches.length !== 1 || !parsed.success) {
@@ -8015,24 +7991,16 @@ export async function readSkillCommandOutput(
     if (value["type"] === "item.completed") {
       const item = value["item"];
       if (
-        typeof item === "object" &&
-        item !== null &&
-        "type" in item &&
-        item.type === "agent_message" &&
-        "text" in item &&
-        typeof item.text === "string"
+        isJsonObject(item) &&
+        item["type"] === "agent_message" &&
+        typeof item["text"] === "string"
       ) {
-        message = item.text;
+        message = item["text"];
       }
     } else if (value["type"] === "turn.failed") {
       const detail = value["error"];
-      if (
-        typeof detail === "object" &&
-        detail !== null &&
-        "message" in detail &&
-        typeof detail.message === "string"
-      ) {
-        error = detail.message;
+      if (isJsonObject(detail) && typeof detail["message"] === "string") {
+        error = detail["message"];
       }
     } else if (
       value["type"] === "error" &&
@@ -8066,6 +8034,16 @@ export function skillCommandFailure(
 }
 
 function incurErrorMessage(output: string): string {
+  // YAML folds long strings across lines; JSON output keeps its serialized form.
+  if (!output.startsWith("{")) {
+    try {
+      const parsed: unknown = parseYaml(output);
+      if (isJsonObject(parsed) && typeof parsed["message"] === "string")
+        return parsed["message"];
+    } catch {
+      // Output that is not YAML (for example a Markdown table) uses the line scan.
+    }
+  }
   const message = output
     .split("\n")
     .find((line) => line.startsWith("message: "))
@@ -8200,6 +8178,7 @@ async function executeScan(
   let deepProgress: DeepScanProgress | null = null;
   let deepConsolidating = false;
   let runningCost: Readonly<ScanCost> | null = null;
+  let runningUsage: Readonly<ScanTokenUsage> | null = null;
   let maxCostUsd = arguments_.maxCostUsd;
   const showCost = arguments_.showCost === true || maxCostUsd !== undefined;
   let phase: string | null = null;
@@ -8425,9 +8404,13 @@ async function executeScan(
           `Files: ${fileProgress.filesCompleted.toLocaleString("en-US")}/${fileProgress.filesTotal.toLocaleString("en-US")}`,
         );
       }
-      if (runningCost !== null) {
-        details.push(`Tokens: ${formatScanCostTokens(runningCost)}`);
-        if (showCost) details.push(`Cost: ${formatScanCost(runningCost)}`);
+      const tokens =
+        runningCost !== null
+          ? formatScanCostTokens(runningCost)
+          : formatTokenUsage(runningUsage);
+      if (tokens !== null) details.push(`Tokens: ${tokens}`);
+      if (showCost && runningCost !== null) {
+        details.push(`Cost: ${formatScanCost(runningCost)}`);
       }
       return details.length === 0 ? stage : `${stage} | ${details.join(" | ")}`;
     };
@@ -8466,6 +8449,20 @@ async function executeScan(
       archiveExisting: arguments_.archiveExisting,
       parentScanId: arguments_.parentScanId,
       expectedPluginVersion: arguments_.expectedPluginVersion,
+      onUsage: async (usage) => {
+        runningUsage = usage;
+        if (dashboard !== null) {
+          dashboard.setUsage(usage);
+          return;
+        }
+        const priorCost = runningCost;
+        // The tracker queues usage before cost; let the paired cost update render once.
+        await Promise.resolve();
+        if (runningCost !== priorCost) return;
+        progress?.stopTimer();
+        progress?.stage(`Tokens: ${formatTokenUsage(usage)}.`);
+        progress?.startTimer(runningMessage());
+      },
       onCost: (cost, limit = maxCostUsd) => {
         if (limit !== maxCostUsd && limit !== undefined) {
           dashboard?.note(`Total cost limit increased to ${formatUsd(limit)}.`);
@@ -9304,13 +9301,12 @@ async function readDeepScanStop(
       nextStep: "To scan further, rerun with a higher --max-cost.",
     };
   }
-  const response = await runWorkbench([
-    "get-deep-scan",
-    "--scan-id",
-    result.manifest.scan.id,
-    "--thread-id",
-    result.threadId,
-  ]);
+  const response = await runWorkbench(
+    workbenchArgs("get-deep-scan", {
+      scanId: result.manifest.scan.id,
+      threadId: result.threadId,
+    }),
+  );
   const state = response["deepScan"] as
     | {
         terminalReason: string;
@@ -9517,9 +9513,14 @@ function componentScanEventLine(
     const progress = event.value;
     return `codex-security: ${componentName} ${scanPhase(progress.phase)} | Files: ${progress.filesCompleted.toLocaleString("en-US")}/${progress.filesTotal.toLocaleString("en-US")}\n`;
   }
-  if (event.type !== "cost") return null;
-  const cost = event.value;
-  return `codex-security: ${componentName} | Tokens: ${formatScanCostTokens(cost)}${showCost ? ` | Cost: ${formatScanCost(cost)}` : ""}\n`;
+  if (event.type === "usage") {
+    const tokens = formatTokenUsage(event.value);
+    return tokens === null
+      ? null
+      : `codex-security: ${componentName} | Tokens: ${tokens}\n`;
+  }
+  if (event.type !== "cost" || !showCost) return null;
+  return `codex-security: ${componentName} | Cost: ${formatScanCost(event.value)}\n`;
 }
 
 function protectedRootErrorMessage(
