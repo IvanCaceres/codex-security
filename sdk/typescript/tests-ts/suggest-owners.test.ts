@@ -1,16 +1,7 @@
+import { modelResponseText } from "./support/model-response-text.js";
 import { execFile as execFileCallback } from "node:child_process";
-import {
-  cp,
-  mkdir,
-  mkdtemp,
-  readFile,
-  realpath,
-  rm,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { cp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { delimiter, join, relative } from "node:path";
 import { promisify } from "node:util";
 import type { ThreadOptions, TurnOptions } from "@openai/codex-sdk";
 import { afterEach, expect, test } from "bun:test";
@@ -21,16 +12,12 @@ import {
   type OwnerFinding,
   type SuggestOwnersOptions,
 } from "../src/suggest-owners.js";
+import { createApiTestFixtures } from "./support/temporary-directories.js";
 
 const execFile = promisify(execFileCallback);
-const directories: string[] = [];
-afterEach(async () => {
-  await Promise.all(
-    directories
-      .splice(0)
-      .map((directory) => rm(directory, { recursive: true, force: true })),
-  );
-});
+const { temporaryDirectory, cleanup } =
+  createApiTestFixtures("owner-repository-");
+afterEach(cleanup);
 
 const finding: OwnerFinding = {
   findingId: "finding-one",
@@ -40,10 +27,7 @@ const finding: OwnerFinding = {
 };
 
 async function repository() {
-  const path = await realpath(
-    await mkdtemp(join(tmpdir(), "owner-repository-")),
-  );
-  directories.push(path);
+  const path = await temporaryDirectory();
   const git = async (...args: string[]) =>
     (await execFile("git", ["-C", path, ...args])).stdout.trim();
   await git("init", "-q");
@@ -88,10 +72,7 @@ function fakeCodex(decide: (context: OwnerContext) => unknown = chooseAlex) {
           ) as OwnerContext;
           calls.push({ context, thread, turn });
           const result = decide(context);
-          return {
-            finalResponse:
-              typeof result === "string" ? result : JSON.stringify(result),
-          };
+          return { finalResponse: modelResponseText(result) };
         },
       };
     },
@@ -113,14 +94,70 @@ function chooseAlex(context: OwnerContext) {
   };
 }
 
+test.each(["ISO-8859-1", "UTF-16LE"])(
+  "preserves blame and history identities with %s Git output configured",
+  async (encoding) => {
+    const repo = await repository();
+    for (const [name, email, version, subject] of [
+      ["Renée Example", "renee@example.test", 1, "Ancienne révision"],
+      ["Zoë Example", "zoe@example.test", 2, "Nouvelle révision"],
+    ] as const) {
+      await writeFile(
+        join(repo.path, "handler.ts"),
+        `// façade\nexport const version = ${version};\n`,
+      );
+      await repo.git(
+        "-c",
+        `user.name=${name}`,
+        "-c",
+        `user.email=${email}`,
+        "commit",
+        "-qam",
+        subject,
+      );
+    }
+    await repo.git("config", "i18n.logOutputEncoding", encoding);
+    for (const [name, email] of [
+      ["Renée Example", "renee@example.test"],
+      ["Zoë Example", "zoe@example.test"],
+    ]) {
+      const { codex, calls } = fakeCodex((context) => {
+        const identityIndex = context.identities.findIndex(
+          (identity) => identity.email === email,
+        );
+        return {
+          identityIndex,
+          reason: "Synthetic ownership selection.",
+          evidenceIds: context.evidence
+            .filter((item) => item.identityIndex === identityIndex)
+            .map(({ id }) => id),
+        };
+      });
+      const report = await suggestOwners(repo.path, [finding], { codex });
+      expect(report.results[0]).toMatchObject({
+        status: "identified",
+        owner: { name, email },
+      });
+      const { context } = calls[0]!;
+      expect(
+        context.evidence.some((item) => item.content.includes("façade")),
+      ).toBe(true);
+      for (const subject of ["Ancienne révision", "Nouvelle révision"])
+        expect(
+          context.evidence.some((item) => item.content.endsWith(subject)),
+        ).toBe(true);
+    }
+    expect(await repo.git("config", "--get", "i18n.logOutputEncoding")).toBe(
+      encoding,
+    );
+  },
+);
+
 test.each(["borrowed-gitfile", "forged-commondir"])(
   "rejects %s before sending another checkout's evidence to Codex",
   async (kind) => {
     const other = await repository();
-    const selected = await realpath(
-      await mkdtemp(join(tmpdir(), "owner-unbound-")),
-    );
-    directories.push(selected);
+    const selected = await temporaryDirectory("owner-unbound-");
     const metadata = await other.git("rev-parse", "--absolute-git-dir");
     if (kind === "borrowed-gitfile") {
       await writeFile(join(selected, ".git"), `gitdir: ${metadata}\n`);
@@ -148,10 +185,7 @@ test.each(["refs", "refs/heads", "HEAD", "packed-refs"])(
   "rejects borrowed %s before sending another checkout's evidence to Codex",
   async (reference) => {
     const other = await repository();
-    const selected = await realpath(
-      await mkdtemp(join(tmpdir(), "owner-borrowed-ref-")),
-    );
-    directories.push(selected);
+    const selected = await temporaryDirectory("owner-borrowed-ref-");
     const branch = await other.git("symbolic-ref", "--short", "HEAD");
     await execFile("git", [
       "init",
@@ -195,10 +229,7 @@ test.each([
   "alternate-pack-link",
 ])("rejects %s before collecting another checkout's objects", async (kind) => {
   const other = await repository();
-  const selected = await realpath(
-    await mkdtemp(join(tmpdir(), "owner-borrowed-objects-")),
-  );
-  directories.push(selected);
+  const selected = await temporaryDirectory("owner-borrowed-objects-");
   await execFile("git", ["init", "--quiet", selected]);
   const objects = join(selected, ".git", "objects");
   const borrowed = join(
@@ -248,8 +279,7 @@ test.each([
   "in-tree-alternate",
 ])("supports a bound %s", async (kind) => {
   const repo = await repository();
-  const root = await realpath(await mkdtemp(join(tmpdir(), "owner-bound-")));
-  directories.push(root);
+  const root = await temporaryDirectory("owner-bound-");
   let selected = repo.path;
   if (kind === "linked-worktree") {
     selected = join(root, "checkout");
@@ -296,12 +326,12 @@ test("combines source, affected-line authorship, and history through the restric
     codex,
     signal,
     model: "synthetic-model",
-    reasoningEffort: "high",
+    reasoningEffort: "future-effort",
   });
   expect(report).toMatchObject({
     revision: repo.revision,
     model: "synthetic-model",
-    reasoningEffort: "high",
+    reasoningEffort: "future-effort",
     results: [
       {
         findingId: finding.findingId,
@@ -325,7 +355,7 @@ test("combines source, affected-line authorship, and history through the restric
   expect(calls[0]!.thread).toMatchObject({
     threadSource: "security_suggest_owners",
     model: "synthetic-model",
-    modelReasoningEffort: "high",
+    modelReasoningEffort: "future-effort",
     sandboxMode: "read-only",
     approvalPolicy: "never",
     networkAccessEnabled: false,
@@ -376,6 +406,85 @@ test("abstains without a model call when locations do not identify committed reg
     ),
   ).toBe(true);
 });
+
+// Keep Unicode coverage even where raw-byte fixture names are unsupported.
+for (const rawByteNames of [false, true]) {
+  test.skipIf(rawByteNames && ["win32", "darwin"].includes(process.platform))(
+    `matches committed ${rawByteNames ? "raw-byte" : "Unicode"} filenames without aliasing replacement characters`,
+    async () => {
+      const repo = await repository();
+      const path = "name-�.ts";
+      if (rawByteNames) {
+        await writeFile(
+          Buffer.concat([
+            Buffer.from(join(repo.path, "name-")),
+            Buffer.from([0xff]),
+            Buffer.from(".ts"),
+          ]),
+          "export const unrelated = 1;\n",
+        );
+        await repo.git("add", ".");
+        await repo.git("commit", "-qm", "Add raw-byte filename");
+      }
+      const { codex, calls } = fakeCodex();
+      const input = [{ ...finding, locations: [{ path, startLine: 1 }] }];
+      const missing = await suggestOwners(repo.path, input, { codex });
+      expect(missing.results[0]!.status).toBe("abstained");
+      expect(missing.results[0]!.limitations).toContain(
+        `Not a regular file at HEAD: ${path}`,
+      );
+      expect(calls).toHaveLength(0);
+
+      await writeFile(
+        join(repo.path, path),
+        "export const actualUnicodeFile = 2;\n",
+      );
+      await repo.git("add", ".");
+      await repo.git("commit", "-qm", "Add Unicode filename");
+      const report = await suggestOwners(repo.path, input, { codex });
+      expect(report.results[0]!.status).toBe("identified");
+      expect(
+        calls[0]!.context.evidence.find(({ kind }) => kind === "source")!
+          .content,
+      ).toBe("1: export const actualUnicodeFile = 2;");
+      const malformed = await suggestOwners(
+        repo.path,
+        [{ ...finding, locations: [{ path: "name-\ud800.ts" }] }],
+        { codex },
+      );
+      expect(malformed.results[0]!.status).toBe("abstained");
+      expect(calls).toHaveLength(1);
+
+      if (process.platform === "win32") return;
+      const tools = await temporaryDirectory();
+      const diagnostic = "Permission denied: café/東/😀";
+      await writeFile(
+        join(tools, "git"),
+        `#!/bin/sh
+for argument; do
+  if [ "$argument" = ls-tree ]; then
+    printf '%s\\n' "$SYNTHETIC_GIT_DIAGNOSTIC" >&2
+    exit 13
+  fi
+done
+exec "$SYNTHETIC_REAL_GIT" "$@"
+`,
+        { mode: 0o700 },
+      );
+      await expect(
+        suggestOwners(repo.path, input, {
+          codex,
+          environment: {
+            ...process.env,
+            PATH: `${tools}${delimiter}${process.env["PATH"] ?? ""}`,
+            SYNTHETIC_REAL_GIT: Bun.which("git")!,
+            SYNTHETIC_GIT_DIAGNOSTIC: diagnostic,
+          },
+        }),
+      ).rejects.toThrow(diagnostic);
+    },
+  );
+}
 
 test("keeps renamed-file blame citations at HEAD and inherits SDK model settings", async () => {
   const repo = await repository();
@@ -507,4 +616,57 @@ test("propagates cancellation", async () => {
       signal: controller.signal,
     }),
   ).rejects.toThrow("Canceled by caller");
+});
+
+test("subdirectory roots retain repository-relative paths when filenames collide", async () => {
+  const repo = await repository();
+  const subdir = join(repo.path, "src");
+  await mkdir(subdir);
+  await writeFile(
+    join(subdir, "handler.ts"),
+    "// Subdirectory handler\nexport function readOther(id) {\n  return other[id];\n}\n",
+  );
+  await repo.git("add", "src/handler.ts");
+  await repo.git(
+    "-c",
+    "user.name=Casey Example",
+    "-c",
+    "user.email=casey@example.test",
+    "commit",
+    "-qm",
+    "Add subdirectory handler",
+  );
+  const { codex, calls } = fakeCodex((context) => {
+    const identityIndex = context.identities.findIndex(
+      (identity) =>
+        identity.email ===
+        (context.evidence[0]!.path.startsWith("src/")
+          ? "casey@example.test"
+          : "alex@example.test"),
+    );
+    return {
+      identityIndex,
+      reason: "Author of the affected committed lines.",
+      evidenceIds: context.evidence
+        .filter((item) => item.identityIndex === identityIndex)
+        .map((item) => item.id),
+    };
+  });
+  const report = await suggestOwners(
+    subdir,
+    [
+      finding,
+      {
+        ...finding,
+        findingId: "subdirectory-finding",
+        locations: [{ path: "src/handler.ts", startLine: 2, endLine: 3 }],
+      },
+    ],
+    { codex },
+  );
+  expect(report.results.map((result) => result.owner?.email)).toEqual([
+    "alex@example.test",
+    "casey@example.test",
+  ]);
+  expect(calls).toHaveLength(2);
 });

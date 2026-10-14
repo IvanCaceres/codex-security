@@ -1,3 +1,4 @@
+import { workbenchArgs } from "./workbench-arguments.js";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -16,7 +17,7 @@ import { loadContract, sameCheckedFileDevice } from "./contract.js";
 import {
   CodexSecurityError,
   ScanInterruptedError,
-  safeErrorMessage,
+  errorMessage,
 } from "./errors.js";
 import {
   bindImportedFindings,
@@ -28,7 +29,7 @@ import {
   codexSecurityStateDirectory,
   expandHome,
   pluginMetadata,
-  prepareOutputDir,
+  prepareScanRegistrationOutput,
   preparePersistentOutputRoot,
   requireOutputOutsideRepository,
   requirePrivateOutputDirectory,
@@ -136,7 +137,7 @@ export async function importScan(
       signal,
     );
     const findings = await parseImportedFindings(
-      source.toString("utf8"),
+      new TextDecoder("utf-8", { fatal: true }).decode(source),
       options.format,
       pluginRoot,
     );
@@ -186,16 +187,12 @@ export async function importScan(
       options.outputDir === undefined
         ? await preparePersistentOutputRoot(stateDirectory, "scans", "imports")
         : undefined;
-    let archivedScanDir: string | undefined;
-    scanDir = await prepareOutputDir(
+    scanDir = await prepareScanRegistrationOutput(
       options.outputDir,
       "import",
       outputRoot,
       (path) => requireOutputOutsideRepository(repository, path),
       options.archiveExisting,
-      (path) => {
-        archivedScanDir = path;
-      },
     );
     const workbenchOptions: WorkbenchCommandOptions = {
       python,
@@ -204,23 +201,16 @@ export async function importScan(
       signal,
       failureMessage: "Could not save the imported scan",
     };
+    signal?.throwIfAborted();
     const registration = await workbench(
       workbenchOptions,
-      [
-        "register-cli-scan",
-        "--repository",
+      workbenchArgs("register-cli-scan", {
         repository,
-        "--scan-dir",
         scanDir,
-        "--registration-json-stdin",
-        ...(options.archiveExisting ? ["--archive-existing"] : []),
-        ...(archivedScanDir === undefined
-          ? []
-          : ["--archived-scan-dir", archivedScanDir]),
-        ...(options.parentScanId === undefined
-          ? []
-          : ["--parent-scan-id", options.parentScanId]),
-      ],
+        registrationJsonStdin: true,
+        archiveExisting: Boolean(options.archiveExisting),
+        parentScanId: options.parentScanId,
+      }),
       JSON.stringify({
         recipe: {
           repository,
@@ -244,6 +234,7 @@ export async function importScan(
       );
     }
     activeScan = { id: scanId, options: workbenchOptions };
+    signal?.throwIfAborted();
     const bound = bindImportedFindings(
       findings,
       options.format,
@@ -275,15 +266,17 @@ export async function importScan(
       "coverage.json": {
         completeness: "unknown",
         inventoryStrategy: "custom",
-        surfaces: [
-          {
-            id: "import",
-            label: basename(inputPath),
-            disposition: "reported",
-            receiptRefs: [sourceRef],
-            notes: IMPORT_DESCRIPTION,
-          },
-        ],
+        surfaces: findings.length
+          ? [
+              {
+                id: "import",
+                label: basename(inputPath),
+                disposition: "reported",
+                receiptRefs: [sourceRef],
+                notes: IMPORT_DESCRIPTION,
+              },
+            ]
+          : [],
         explicitExclusions: [],
         deferred: [],
       },
@@ -295,11 +288,10 @@ export async function importScan(
         { flag: "wx", signal },
       );
     }
-    await workbench(workbenchOptions, [
-      "prepare-scan-completion",
-      "--scan-id",
-      scanId,
-    ]);
+    await workbench(
+      workbenchOptions,
+      workbenchArgs("prepare-scan-completion", { scanId }),
+    );
     // Finalization normally recovers partial output. An import must retain every supplied row.
     const contract = await loadContract(scanDir, {
       pluginRoot,
@@ -312,8 +304,7 @@ export async function importScan(
       contract.findings.findings.length !== findings.length ||
       contract.findings.findings.some(
         (finding) => !expectedIds.delete(finding.findingId),
-      ) ||
-      expectedIds.size !== 0
+      )
     ) {
       throw new CodexSecurityError(
         "Import finalization did not preserve every input finding; the scan was not completed.",
@@ -337,8 +328,7 @@ export async function importScan(
         "fail-scan",
         "--scan-id",
         activeScan.id,
-        "--message",
-        safeErrorMessage(error).slice(0, 2400),
+        `--message=${errorMessage(error).slice(0, 2400)}`,
       ]).catch(() => undefined);
     }
     if (signal?.aborted) {

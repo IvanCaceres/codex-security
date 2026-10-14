@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { DeepScanRunState } from "./types.js";
 
 const MAX_PERSISTED_ERROR_LENGTH = 2_400;
 
@@ -22,6 +23,31 @@ export class DeepScanNonRetryableError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "DeepScanNonRetryableError";
+  }
+}
+
+/** A store read confirmed that this coordinator no longer owns the scan. */
+export class DeepScanOwnershipChangedError extends Error {
+  constructor(
+    readonly run: DeepScanRunState,
+    cause: unknown,
+  ) {
+    super(errorMessage(cause), { cause });
+    this.name = "DeepScanOwnershipChangedError";
+  }
+}
+
+/** Only a store-confirmed state for this scan establishes ownership loss. */
+export function confirmedOwnershipChange(
+  error: unknown,
+  scanId: string,
+): DeepScanOwnershipChangedError | undefined {
+  for (let cause = error; cause instanceof Error; cause = cause.cause) {
+    if (
+      cause instanceof DeepScanOwnershipChangedError &&
+      cause.run.scanId === scanId
+    )
+      return cause;
   }
 }
 
@@ -80,8 +106,7 @@ export function isStaleCoordinatorGenerationError(error: unknown): boolean {
 
 /** A safety refusal retires the refused thread; it is not a broken scan. */
 export function isCodexCybersecurityPolicyRefusal(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return CYBERSECURITY_POLICY_REFUSAL_MESSAGES.has(message);
+  return CYBERSECURITY_POLICY_REFUSAL_MESSAGES.has(errorMessage(error));
 }
 
 export function classifyCodexWorkerError(error: unknown): Error {
@@ -90,4 +115,20 @@ export function classifyCodexWorkerError(error: unknown): Error {
   // unless a producer explicitly identifies the failure as nonretryable. The
   // worker runner handles exact policy refusals without failing the scan.
   return error instanceof Error ? error : new Error(String(error));
+}
+
+export function abortError(reason?: unknown): Error {
+  const error = new Error("Deep Scan worker was aborted.", { cause: reason });
+  error.name = "AbortError";
+  return error;
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function errorNameWithCode(error: Error): string {
+  const code =
+    "code" in error && typeof error.code === "string" ? error.code : undefined;
+  return code ? `${error.name}:${code}` : error.name;
 }

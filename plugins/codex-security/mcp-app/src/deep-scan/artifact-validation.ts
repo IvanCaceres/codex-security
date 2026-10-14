@@ -69,7 +69,7 @@ export async function validateDiscoveryArtifacts(
   return result;
 }
 
-/** Validate the complete aggregate and derive convergence from stable finding identities. */
+/** Validate the complete aggregate and derive convergence from retained source ancestry. */
 export async function validateReducerArtifacts(
   input: {
     artifacts: DeepScanArtifacts;
@@ -127,12 +127,18 @@ export async function validateReducerArtifacts(
     validateRetainedFindings(result, [], previous);
   }
   const previousFindingIds = new Set(
-    (previous?.findings ?? []).map(scanFindingIdentity),
+    input.sources
+      ? (previous?.findings ?? [])
+          .flatMap(retainedFindingSources)
+          .map((source) => source.id)
+      : (previous?.findings ?? []).map(scanFindingIdentity),
   );
   return {
     result,
-    newFindings: result.findings.filter(
-      (finding) => !previousFindingIds.has(scanFindingIdentity(finding)),
+    newFindings: result.findings.filter((finding) =>
+      input.sources
+        ? !findingSourceIds(finding).some((id) => previousFindingIds.has(id))
+        : !previousFindingIds.has(scanFindingIdentity(finding)),
     ).length,
   };
 }
@@ -144,10 +150,6 @@ export function reconcileDeepReduction(
   previous: DeepReductionInput | null,
 ): DeepReductionInput {
   const result = structuredClone(input);
-  if (result.complete === false)
-    throw new Error(
-      "Deep reduction is only a checkpoint, not a complete result.",
-    );
   for (const source of [
     ...discoveries.map((discovery) => discovery.result),
     ...(previous ? [previous] : []),
@@ -165,82 +167,60 @@ export function reconcileDeepReduction(
     previous ?? undefined,
   );
   retainSourceFindings(result, { discoveries, previous });
-  const unmatched = new Set(result.findings);
-  for (const finding of previous?.findings ?? []) {
-    const previousRefs = findingSourceIds(finding);
-    const retained =
-      (previousRefs.length > 0
-        ? result.findings.find((current) =>
-            findingSourceIds(current).some((ref) => previousRefs.includes(ref)),
-          )
-        : undefined) ??
-      [...unmatched].find(
-        (current) =>
-          scanFindingIdentity(current) === scanFindingIdentity(finding),
-      );
+  for (const [index, finding] of (previous?.findings ?? []).entries()) {
+    const previousRefs = retainedFindingSources(finding, index).map(
+      (source) => source.id,
+    );
+    const retained = result.findings.find((current) =>
+      findingSourceIds(current).some((ref) => previousRefs.includes(ref)),
+    );
     if (retained) {
+      const sourceIds = findingSourceIds(retained);
       preserveFindingDetails(retained, finding);
-      unmatched.delete(retained);
+      (retained.provenance as Record<string, unknown>).sourceFindingIds =
+        sourceIds;
     }
   }
   retainSourceFindings(result, { discoveries, previous });
-  if (result.threatModel === undefined) {
-    const sourceModels = [
-      ...discoveries.map((discovery) => discovery.result.threatModel),
-      previous?.threatModel,
-    ].filter((model): model is Record<string, unknown> => model !== undefined);
-    const distinctModels = sourceModels.filter(
-      (model, index) =>
-        sourceModels.findIndex((candidate) =>
-          isDeepStrictEqual(candidate, model),
-        ) === index,
-    );
-    if (distinctModels.length > 1) {
+  for (const [field, label] of [
+    ["threatModel", "threat models"],
+    ["scope", "scopes"],
+  ] as const) {
+    if (result[field] !== undefined) continue;
+    const sourceValues = [
+      ...discoveries.map((discovery) => discovery.result[field]),
+      previous?.[field],
+    ].filter((value) => value !== undefined);
+    if (
+      sourceValues.some((value) => !isDeepStrictEqual(sourceValues[0], value))
+    ) {
       throw new Error(
-        "Deep reduction has ambiguous threat models; provide the reconciled threatModel explicitly.",
+        `Deep reduction has ambiguous ${label}; provide the reconciled ${field} explicitly.`,
       );
     }
-    if (distinctModels[0] !== undefined) {
-      result.threatModel = structuredClone(distinctModels[0]);
-    }
-  }
-  if (result.scope === undefined) {
-    const sourceScopes = [
-      ...discoveries.map((discovery) => discovery.result.scope),
-      previous?.scope,
-    ].filter((scope): scope is Record<string, unknown> => scope !== undefined);
-    const distinctScopes = sourceScopes.filter(
-      (scope, index) =>
-        sourceScopes.findIndex((candidate) =>
-          isDeepStrictEqual(candidate, scope),
-        ) === index,
-    );
-    if (distinctScopes.length > 1) {
-      throw new Error(
-        "Deep reduction has ambiguous scopes; provide the reconciled scope explicitly.",
-      );
-    }
-    if (distinctScopes[0] !== undefined) {
-      result.scope = structuredClone(distinctScopes[0]);
+    if (sourceValues[0] !== undefined) {
+      Object.assign(result, { [field]: structuredClone(sourceValues[0]) });
     }
   }
   return result;
 }
 
 function findingSourceIds(finding: Record<string, unknown>): string[] {
-  const provenance = finding.provenance as Record<string, unknown>;
-  const ids = provenance.sourceFindingIds;
-  if (Array.isArray(ids))
-    return ids.filter((id): id is string => typeof id === "string");
-  const sources = provenance.sourceFindings;
-  if (!Array.isArray(sources)) return [];
-  return sources.flatMap((source) =>
-    typeof source === "object" &&
-    source !== null &&
-    typeof (source as { id?: unknown }).id === "string"
-      ? [(source as { id: string }).id]
-      : [],
-  );
+  const { sourceFindingIds, sourceFindings } = finding.provenance as {
+    sourceFindingIds?: string[];
+    sourceFindings?: { id: string }[];
+  };
+  return sourceFindingIds ?? sourceFindings?.map((source) => source.id) ?? [];
+}
+
+function retainedFindingSources(
+  finding: Record<string, unknown>,
+  index: number,
+) {
+  const originals = (finding.provenance as Record<string, unknown>)
+    .sourceFindings as
+    Array<{ id: string; finding: Record<string, unknown> }> | undefined;
+  return originals?.length ? originals : [{ id: `previous:${index}`, finding }];
 }
 
 function retainSourceFindings(
@@ -256,17 +236,10 @@ function retainSourceFindings(
       sources.set(`${discovery.workerId}:${index}`, original);
     }
   }
-  for (const [index, finding] of (inputs.previous?.findings ?? []).entries()) {
-    const provenance = finding.provenance as Finding;
-    const originals = provenance.sourceFindings as
-      Array<{ id: string; finding: Finding }> | undefined;
-    if (originals?.length) {
-      for (const original of originals)
-        sources.set(original.id, original.finding);
-    } else {
-      sources.set(`previous:${index}`, finding);
-    }
-  }
+  for (const original of (inputs.previous?.findings ?? []).flatMap(
+    retainedFindingSources,
+  ))
+    sources.set(original.id, original.finding);
   const claimed = new Set<string>();
   for (const finding of result.findings) {
     const provenance = finding.provenance as Finding;
@@ -300,13 +273,11 @@ function retainSourceFindings(
         );
       claimed.add(id);
     }
-    if (refs.length) {
-      provenance.sourceFindingIds = refs;
-      provenance.sourceFindings = refs.map((id) => ({
-        id,
-        finding: structuredClone(sources.get(id)!),
-      }));
-    }
+    provenance.sourceFindingIds = refs;
+    provenance.sourceFindings = refs.map((id) => ({
+      id,
+      finding: structuredClone(sources.get(id)!),
+    }));
   }
   const missing = [...sources.keys()].filter((id) => !claimed.has(id));
   if (missing.length)
@@ -345,26 +316,25 @@ export function validateRetainedFindings(
   }
 }
 
-function parseStoredScanDraft<Result extends DeepReductionInput>(
+export function parseStoredScanDraft<Result extends DeepReductionInput>(
   value: Record<string, unknown>,
   label: string,
   expectedScanId: string | undefined,
   parse: (input: Record<string, unknown>) => Result,
+  invalidResultMessage = " returned an invalid Standard scan result: ",
+  differentScanMessage = " returned a result for a different scan.",
 ): Result {
   let parsed: Result;
   try {
     parsed = parse(value);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      label + " returned an invalid Standard scan result: " + detail,
-      {
-        cause: error,
-      },
-    );
+    throw new Error(label + invalidResultMessage + detail, {
+      cause: error,
+    });
   }
   if (expectedScanId !== undefined && parsed.scanId !== expectedScanId) {
-    throw new Error(label + " returned a result for a different scan.");
+    throw new Error(label + differentScanMessage);
   }
   return parsed;
 }
